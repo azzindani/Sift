@@ -1,0 +1,180 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── LINT & FORMAT ─────────────────────────────────────────────
+  lint:
+    name: Lint & Format
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --frozen --all-extras
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+
+  # ── CONTRACTS ─────────────────────────────────────────────────
+  # The rules that are load-bearing rather than stylistic. Each one, if broken,
+  # degrades the agent's experience silently — so a human will not catch it.
+  contracts:
+    name: Contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --frozen
+
+      - name: Tool surface (count, docstrings, annotations)
+        # The whole schema is sent to the model on every turn: a tool over the
+        # ceiling or a docstring over 80 chars is a permanent tax on every call.
+        run: |
+          uv run python - <<'PY'
+          import asyncio, sys
+          from server import mcp
+
+          async def main():
+              tools = await mcp.get_tools()
+              bad = []
+              if len(tools) > 10:
+                  bad.append(f"{len(tools)} tools exceeds the ceiling of 10")
+              for name, tool in tools.items():
+                  desc = tool.description or ""
+                  if not desc:
+                      bad.append(f"{name}: no docstring")
+                  elif len(desc) > 80:
+                      bad.append(f"{name}: docstring is {len(desc)} chars (max 80)")
+                  if tool.annotations is None:
+                      bad.append(f"{name}: missing annotations")
+              if bad:
+                  print("\n".join(bad), file=sys.stderr)
+                  sys.exit(1)
+              print(f"{len(tools)} tools, all within contract")
+
+          asyncio.run(main())
+          PY
+
+      - name: No stdout writes
+        # stdout is the MCP channel on stdio transport. One print() corrupts it.
+        run: |
+          if grep -rnE '^\s*print\(' server.py engine.py _clip_*.py shared/*.py; then
+            echo "print() found — all diagnostics go to stderr via logging" >&2
+            exit 1
+          fi
+          echo "no stdout writes"
+
+      - name: Subprocess safety
+        # Every external process goes through shared/platform_utils.run(): argv list,
+        # shell=False, explicit timeout, captured output.
+        run: |
+          if grep -rnE 'shell=True|\beval\(|\bexec\(|os\.system' server.py engine.py _clip_*.py shared/*.py; then
+            echo "unsafe subprocess/eval usage found" >&2
+            exit 1
+          fi
+          echo "no shell=True / eval / exec / os.system"
+
+      - name: File size limit
+        run: |
+          fail=0
+          for f in server.py engine.py _clip_*.py shared/*.py; do
+            n=$(wc -l < "$f")
+            if [ "$n" -gt 1000 ]; then echo "$f is $n lines (max 1000)" >&2; fail=1; fi
+          done
+          [ "$fail" -eq 0 ] && echo "all files within 1000 lines"
+
+      - name: Secrets are not committed
+        run: |
+          if [ -f tokens.json ]; then
+            echo "tokens.json is committed — it must be gitignored" >&2
+            exit 1
+          fi
+          echo "no tokens.json in the tree"
+
+  # ── TESTS ─────────────────────────────────────────────────────
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          ffmpeg -hide_banner -encoders | grep -q libx264    # encode
+          ffmpeg -hide_banner -filters  | grep -q subtitles  # libass, caption burn-in
+          ffmpeg -hide_banner -filters  | grep -q xfade      # member crossfades
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - run: uv sync --frozen --all-extras
+
+      - name: Test suite
+        # The render tests shell out to real ffmpeg and assert on the encoded bytes —
+        # dimensions, duration, audio presence. Nothing here is mocked, because every
+        # interesting bug in this codebase lives in the filtergraph.
+        run: uv run pytest tests/ -q --timeout=900
+
+  # ── DOCKER ────────────────────────────────────────────────────
+  docker:
+    name: Docker image
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: sift:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test the image
+        # A container that builds but does not serve is not a deployment. Boot it,
+        # prove /health is public, prove /mcp is gated, prove it runs unprivileged.
+        run: |
+          docker run -d --name sift-ci -p 8765:8765 \
+            -e SIFT_API_KEY=sk-ci-token sift:ci
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8765/health >/dev/null 2>&1; then break; fi
+            sleep 2
+          done
+
+          echo "--- /health is public and reports a working toolchain"
+          curl -fsS http://127.0.0.1:8765/health | tee /tmp/health.json
+          grep -q '"ok":true' /tmp/health.json
+
+          echo "--- /mcp rejects an unauthenticated call"
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8765/mcp -d '{}')
+          [ "$code" = "401" ] || { echo "expected 401, got $code" >&2; exit 1; }
+
+          echo "--- /tokens/whoami accepts the bearer"
+          curl -fsS http://127.0.0.1:8765/tokens/whoami \
+            -H 'Authorization: Bearer sk-ci-token' | grep -q '"authenticated":true'
+
+          echo "--- container runs unprivileged"
+          docker exec sift-ci id -u | grep -qv '^0$'
+
+          docker rm -f sift-ci

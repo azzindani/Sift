@@ -1,94 +1,171 @@
-# Clipper
+# Sift
 
-Turn long-form video into short, publish-ready vertical clips: self-hosted MCP server,
-agentic AI as the intelligence, runs on a small VPS.
+Turn long-form video into short, publish-ready vertical clips. Self-hosted MCP server,
+agentic AI as the intelligence, file-backed project library, runs on a small VPS.
 
-> **Deployment target:** Linux VPS (2 vCPU / 4 GB), agentic AI client over HTTP/MCP.
-> This is **not** a local-model tool — the selection brain is an agentic cloud model, and
-> fetch/vision are network operations by design. See [`CLAUDE.md`](CLAUDE.md) §4 for how this
-> intentionally diverges from the org MCP `STANDARDS.md` (which targets offline local models).
+> **Deployment target:** Linux VPS (2 vCPU / 4 GB), agentic AI client over HTTP/MCP with a
+> bearer token — the same endpoint style as [Folio](https://github.com/azzindani/Folio).
+> This is **not** a local-model tool: the selection brain is an agentic cloud model, and
+> fetch/vision are network operations by design. See [`CLAUDE.md`](CLAUDE.md) §4 for how it
+> intentionally diverges from the org MCP `STANDARDS.md`.
+
+## What it does
+
+Give it a 3-hour podcast. It reads the transcript in overlapping windows, lets the agent
+pick what's clip-worthy, then deterministically cuts, trims dead air, reframes to 9:16 with
+a smoothed face-follow crop, burns in word-pop captions, and hands back links plus a
+summary that **deep-links every clip back to its exact moment in the source**, so you can
+falsify any pick in one click.
 
 ## Features
 
-- **8 tools**, pipeline-shaped: fetch → read-chunk → add-candidates → plan → render → publish
-- Agent decides what to clip; the server only executes (zero inference in tools)
+- **9 tools**, pipeline-shaped: fetch → read-chunk → add-candidates → plan → render → publish
+- **The agent decides; the server only executes.** Zero inference in any tool.
+- **File-backed project library** — YAML records you can read, diff, and hand-edit. Fix a
+  clip's boundary in a text editor and the next `plan_clips` picks up the change.
+- **Token-authed HTTP endpoint** (`Authorization: Bearer`), named tokens, rate limiting
 - Chunked, overlapping transcript reading — no missed boundary-straddling moments
 - Generalizes beyond quotes via a label + skill registry (jokes, stories, arguments,
-  reactions, montages, supercuts) — new types are data, not code
+  reactions, montages, supercuts) — new types are **data, not code**
 - Spike-shaped execution: thin standby router, all heavy work in short-lived subprocesses
-- 9:16 reframe with smoothed face-follow crop, word-pop captions reused from the transcript,
-  dead-air trimming, thumbnails, transitions — all via ffmpeg
-- Disposable source, durable output: links + a verifiable summary mapping each clip to its
-  source timestamp and original URL
+- Disposable source, durable output: a 3h source is ~2.7 GB and is deleted after the cut;
+  clips (~10 MB) and transcripts (~400 KB) persist
+
+## Quick start
+
+```sh
+cp .env.example .env
+cp tokens.example.json tokens.json     # put real random strings in it
+docker compose up -d --build
+curl -fsS localhost:8765/health | jq .
+```
+
+Point a client at it:
+
+```json
+{
+  "mcpServers": {
+    "sift": {
+      "type": "http",
+      "url": "http://localhost:8765/mcp",
+      "headers": { "Authorization": "Bearer sk-sift-..." }
+    }
+  }
+}
+```
+
+For a public VPS with automatic HTTPS, set `SIFT_DOMAIN` in `.env` and run
+`docker compose --profile tls up -d`. Full detail: [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
+
+## The endpoint
+
+| Path | Auth | Purpose |
+|---|---|---|
+| `POST /mcp` | Bearer | MCP JSON-RPC — `initialize`, `tools/list`, `tools/call` |
+| `GET /health` | public | Liveness + toolchain. `503` when ffmpeg is broken. |
+| `GET /version` | public | Running version — alert on a stale deploy without a token. |
+| `GET /tokens/whoami` | Bearer | Which named token you are. |
+| `GET /clips/{batch}/{file}` | Bearer | Published clips, thumbnails, manifests, galleries. |
+
+Auth is four modes in priority order — `SIFT_TOKENS_FILE` > `SIFT_TOKENS` > `SIFT_API_KEY` >
+open (localhost only, warns loudly). Same contract as Folio, so one client config style
+reaches both.
+
+## The library
+
+Work is organised into projects. **The files are the record** — SQLite is demoted to the
+render queue and a *rebuildable* index.
+
+```
+sift-projects/<project>/
+├── project.yaml            # index: sources, clips, exports
+├── sources/<source_id>/
+│   ├── source.yaml         # url, title, duration, transcript_kind
+│   ├── transcript.json     # durable — outlives the video
+│   └── video.mp4           # EPHEMERAL — deleted at publish
+├── candidates/<source_id>.yaml   # the agent's picks — edit these by hand
+├── clips/<clip_id>/
+│   ├── clip.yaml           # members, label, assembly spec
+│   ├── clip.mp4            # durable artifact
+│   └── clip.jpg
+└── exports/<batch_id>/     # manifest.json, index.html
+```
+
+Delete `sift-data/sift.db` and it repopulates from the YAML on next boot. The database can
+never disagree with the library, because the library wins.
 
 ## How it works
 
-1. `fetch_source(url)` pulls the source at ≤720p + transcript (`json3` word-timing), with a
-   disk guard and URL dedup.
+1. `fetch_source(url, project="ep42")` pulls the source at ≤720p + transcript, with a disk
+   guard, URL dedup, and a caption check *before* any video is downloaded.
 2. The agent reads the transcript in overlapping windows via `read_transcript_chunk`, judges
    clip-worthiness, labels intent, and submits picks with `add_candidates`.
 3. `plan_clips` groups candidates by label/topic into clip definitions.
-4. `render_clip` enqueues an async job; a single worker trims silence, cuts, reframes,
-   captions, and thumbnails. The agent polls `get_job`.
-5. `publish_outputs` moves clips to the served directory and returns links plus a summary that
-   deep-links back to the original video for verification.
+4. `render_clip` enqueues an async job. A **single worker** trims silence, cuts, reframes,
+   captions, and thumbnails — one encode at a time. The agent polls `get_job`.
+5. `publish_outputs` returns links plus a summary that deep-links back to the original.
+6. `list_library` browses projects, sources, clips, and exports.
 
 Full design: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) ·
 [`docs/PIPELINE.md`](docs/PIPELINE.md) · [`docs/TOOLS.md`](docs/TOOLS.md) ·
 [`docs/LABELS_AND_SKILLS.md`](docs/LABELS_AND_SKILLS.md) ·
-[`docs/OUTPUT_CONTRACT.md`](docs/OUTPUT_CONTRACT.md)
+[`docs/OUTPUT_CONTRACT.md`](docs/OUTPUT_CONTRACT.md) ·
+[`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)
 
 ## Requirements
 
-- **Python 3.12 or higher**
-- **uv** — https://docs.astral.sh/uv/getting-started/installation/
-- **ffmpeg** (with libx264) and **yt-dlp** available on the host
-- An agentic AI client that speaks MCP over HTTP
-- A bundled caption font in `assets/fonts/` (referenced by path, never system-resolved)
+- **Docker** (recommended), or **Python 3.12** + **uv** + **ffmpeg** (libx264 + libass)
+- An agentic AI client that speaks MCP
 
-## Install (VPS, HTTP transport)
+yt-dlp is a pinned Python dependency — no PATH lookup, version locked by `uv.lock`. The
+caption font is bundled in `assets/fonts/`; system fonts are never resolved, because they
+are not deterministic across hosts.
 
-Self-updating launch (STANDARDS §31): clone-guard on `.git`, `git fetch + reset --hard`,
-`uv sync` on launch, `MCP_CONSTRAINED_MODE` env var.
+### Face-follow reframing (optional)
+
+`reframe="speaker"` and `"stacked"` use MediaPipe. It is a ~300 MB optional extra,
+lazy-imported inside the render worker:
 
 ```sh
-d="$HOME/.mcp_servers/Clipper"
-if [ ! -d "$d/.git" ]; then rm -rf "$d"; git clone https://github.com/azzindani/Clipper.git "$d" --quiet
-else cd "$d" && git fetch origin --quiet && git reset --hard FETCH_HEAD --quiet; fi
-cd "$d" && uv sync --quiet
-MCP_CONSTRAINED_MODE=1 uv run python server.py --transport http --port 8765
+SIFT_VISION=1 docker compose up -d --build     # or: uv sync --extra vision
 ```
 
-Front it with Caddy for TLS + the served clips directory. Optionally wrap with Sablier-style
-on-demand lifecycle for true zero-idle RAM at the cost of cold-start latency.
+**Without it the server still works.** `speaker` degrades to a centred crop and says so in
+the job's progress. On a 4 GB box you may not want the footprint, and a centred crop on a
+talking-head source is usually fine.
 
-## Configuration
+## Development
 
-| Env var | Purpose | Default |
-|---|---|---|
-| `MCP_CONSTRAINED_MODE` | VPS limits: encode concurrency 1, lower vision frame budget, capped source resolution, smaller read windows | `1` on small boxes |
-| `CLIPPER_COOKIES_PATH` | yt-dlp cookies file (mitigates VPS bot challenges) | unset |
-| `CLIPPER_PROXY` | proxy for yt-dlp | unset |
-| `CLIPPER_SERVE_DIR` | served outputs directory | `./served` |
-| `CLIPPER_TTL_HOURS` | output retention | `168` |
+```sh
+uv sync --all-extras
+uv run pytest tests/ -q          # 73 tests; render tests run real ffmpeg, nothing is mocked
+uv run ruff check . && uv run ruff format --check .
+```
 
-## A note on the constrained box
+The render tests build a synthetic source (a tone cycling 6s on / 4s off, so `silencedetect`
+has real dead air to find) and assert on the **actual encoded bytes** — dimensions, duration,
+audio presence — because every interesting bug in this codebase lives in the filtergraph, not
+in the Python around it.
 
-This server runs on a 2 vCPU / 4 GB VPS. Standby is a thin router (~tens of MB); all heavy
-work happens as short-lived subprocesses that release memory on exit. It is a **queue-and-cook
-async service**, not real-time — run one render at a time and let jobs cook. Disk, not RAM, is
-the limiting resource: sources are downloaded at capped resolution, processed, and deleted.
+## Caveats — the honest ones
 
-## Caveats
-
-- **yt-dlp on a VPS IP** is the most fragile dependency — datacenter IPs draw bot challenges.
-  Configure `CLIPPER_COOKIES_PATH` / `CLIPPER_PROXY`; fetch failure is an expected path.
-- **Transcript timing** is best-effort: `json3` gives word-level (word-pop captions); VTT is
-  cue-level (line captions + snap-to-silence cuts); no-caption sources need external
-  transcription, which v1 does not run by default.
-- **Copyright / platform ToS** for downloading and republishing content is the operator's
-  responsibility.
+- **yt-dlp on a VPS IP is the most fragile dependency.** Datacenter IPs draw bot challenges.
+  Fetch failure is an *expected* return path: it comes back as an error dict whose hint names
+  the knob (`SIFT_COOKIES_PATH`, `SIFT_PROXY`) that fixes it. Verified: YouTube challenges a
+  datacenter IP; TED works without cookies.
+- **Transcript timing is best-effort.** `json3` gives word-level timing (word-pop captions).
+  VTT is cue-level, so captions fall back to styled lines — faking per-word timing from cue
+  timing would put words on screen at the wrong moment, so we don't. Sources with no captions
+  are rejected at fetch, *before* the video is downloaded.
+- **`stacked` needs a real two-shot.** If MediaPipe doesn't find two distinct face clusters it
+  falls back to speaker-follow and says so.
+- **Label quality is bounded by signal.** Text-carried intent (quote, joke, argument) is
+  dependable. Intent that lives only in the video is not — "funny" is subjective enough that
+  no model scores it perfectly. The edge is the cheap-cue → vision funnel: free audio/text cues
+  decide *where to look*, so vision is only paid for on flagged spans.
+- **Copyright / platform ToS** for downloading and republishing is the operator's
+  responsibility. The tool does not enforce it.
 
 ## License
 
-MIT (dependencies vetted against the approved-license list in `STANDARDS.md` §33).
+MIT. Bundled font: Liberation Sans, SIL Open Font License 1.1 (see [`LICENSE`](LICENSE)).

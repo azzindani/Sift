@@ -1,0 +1,172 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Sift — local & VPS compose stack. Same shape as Folio's, so one mental model
+# covers both.
+#
+# Quick start (local, no TLS):
+#   cp .env.example .env
+#   cp tokens.example.json tokens.json      # then put real random tokens in it
+#   docker compose up -d --build
+#   → MCP:    http://localhost:8765/mcp     (Bearer auth)
+#   → health: http://localhost:8765/health  (public)
+#
+# VPS with auto-HTTPS (Let's Encrypt via Caddy):
+#   1. DNS:  A  sift.mydomain.tld -> <vps-ip>
+#   2. .env: SIFT_DOMAIN=sift.mydomain.tld, SIFT_ACME_EMAIL=you@x
+#   3. docker compose --profile tls up -d --build
+#   → MCP:    https://sift.mydomain.tld/mcp
+#
+# Persistence — the one thing that matters:
+#   ./sift-projects  is the LIBRARY (YAML records + rendered clips). Back this up.
+#   ./sift-data      is the job queue + scratch. Rebuildable; safe to lose.
+# ─────────────────────────────────────────────────────────────────────────────
+services:
+  sift:
+    build:
+      context: .
+      args:
+        # MediaPipe face-follow reframing (~300 MB). 0 = skip it; reframe="speaker"
+        # then degrades to a centred crop and says so in the job progress.
+        VISION: ${SIFT_VISION:-0}
+    # Default: build from local source. To run the PUBLISHED image instead (required
+    # for Watchtower auto-update — it pulls a registry tag, it cannot rebuild source):
+    #   SIFT_IMAGE=ghcr.io/azzindani/sift:latest  in .env
+    #   docker compose up -d --pull always --no-build
+    image: ${SIFT_IMAGE:-sift:latest}
+    container_name: sift
+    restart: unless-stopped
+    labels:
+      # Scopes the optional Watchtower below to THIS container only.
+      com.centurylinklabs.watchtower.enable: "true"
+
+    # The render worker is the memory story: ffmpeg is modest, but MediaPipe adds
+    # ~300-400 MB while a reframe is in flight. 2 GiB holds a 4 GB VPS comfortably;
+    # raise it if you enable VISION and cut long clips.
+    mem_limit: ${SIFT_MEM_LIMIT:-2g}
+    memswap_limit: ${SIFT_MEM_LIMIT:-2g}
+    # Two encodes never run at once (the single render worker enforces that), so
+    # capping CPU keeps ffmpeg from starving the router on a small box.
+    cpus: ${SIFT_CPUS:-2}
+
+    environment:
+      SIFT_HOST: 0.0.0.0
+      SIFT_PORT: 8765
+      SIFT_PROJECTS_DIR: /home/sift/projects
+      SIFT_DATA_DIR: /home/sift/.sift
+
+      # VPS resource profile: 480p source cap, 5-min read windows, 24-frame vision budget.
+      MCP_CONSTRAINED_MODE: ${MCP_CONSTRAINED_MODE:-1}
+
+      # Auth — pick ONE. The file wins if several are set.
+      SIFT_TOKENS_FILE: ${SIFT_TOKENS_FILE:-}
+      SIFT_TOKENS:      ${SIFT_TOKENS:-}
+      SIFT_API_KEY:     ${SIFT_API_KEY:-}
+
+      # Per (token, client-IP) token bucket. Either at 0 disables it.
+      SIFT_RATE_BURST:   ${SIFT_RATE_BURST:-40}
+      SIFT_RATE_PER_SEC: ${SIFT_RATE_PER_SEC:-10}
+
+      # The public base URL baked into published links. Without it the manifest
+      # would hand out http://localhost:8765 even on a real deployment.
+      SIFT_BASE_URL: ${SIFT_BASE_URL:-${SIFT_DOMAIN:+https://${SIFT_DOMAIN}/clips}}
+      SIFT_TTL_HOURS: ${SIFT_TTL_HOURS:-168}
+
+      # yt-dlp on a datacenter IP draws bot challenges. These are the two knobs
+      # that fix it; fetch_source names them in its error hint when it trips.
+      SIFT_COOKIES_PATH: ${SIFT_COOKIES_PATH:-}
+      SIFT_PROXY:        ${SIFT_PROXY:-}
+      # A Docker bridge has no IPv6 route, but DNS still returns AAAA records — so
+      # yt-dlp intermittently picks IPv6 and dies with "Network is unreachable".
+      SIFT_FORCE_IPV4:   ${SIFT_FORCE_IPV4:-1}
+
+      SIFT_LOG_LEVEL: ${SIFT_LOG_LEVEL:-INFO}
+
+    ports:
+      # Exposed on the host only when running WITHOUT the tls profile. With Caddy in
+      # front you would drop this and keep Sift on the internal network.
+      - "${SIFT_PORT:-8765}:8765"
+
+    volumes:
+      # THE DATA. Everything else in this stack is reconstructible; this is not.
+      - ./sift-projects:/home/sift/projects
+      # Job queue + scratch. Kept out of the library so a wipe is harmless.
+      - ./sift-data:/home/sift/.sift
+      # Mount tokens.json read-only when SIFT_TOKENS_FILE is set. Optional —
+      # comment out if you use SIFT_TOKENS (inline) or SIFT_API_KEY instead.
+      - ./tokens.json:/home/sift/tokens.json:ro
+      # Optional: a cookies.txt for yt-dlp, to get past bot challenges.
+      # - ./cookies.txt:/home/sift/cookies.txt:ro
+
+    networks:
+      - sift_net
+
+    # Docker's embedded DNS resolver can return AAAA records but drop the A record for a
+    # host — and a default bridge network has no IPv6 route. yt-dlp then fails with
+    # "Network is unreachable", or with "No remote IPv4 addresses available" if you pin it
+    # to IPv4. Verified: inside the container www.ted.com resolved to IPv6 *only*, while the
+    # host got both. Real resolvers fix it. Override with SIFT_DNS if your network needs it.
+    dns:
+      - ${SIFT_DNS1:-1.1.1.1}
+      - ${SIFT_DNS2:-8.8.8.8}
+
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8765/health >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: sift-caddy
+    profiles: ["tls"]
+    restart: unless-stopped
+    depends_on:
+      - sift
+    environment:
+      SIFT_DOMAIN: ${SIFT_DOMAIN:?set SIFT_DOMAIN in .env (e.g. sift.example.com)}
+      SIFT_ACME_EMAIL: ${SIFT_ACME_EMAIL:?set SIFT_ACME_EMAIL in .env for Let's Encrypt}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - sift_net
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # OPT-IN auto-update.  docker compose --profile autoupdate up -d
+  #
+  # Off by default, on purpose. Unattended upgrades are a real trade-off: you get
+  # fixes without touching the box, but a bad release lands on your deployment
+  # automatically, and anyone who compromises the registry runs code on your host.
+  # Pin a tag (SIFT_IMAGE=ghcr.io/azzindani/sift:0.1.0) if you would rather review
+  # each release and update on purpose.
+  #
+  # REQUIRES a registry image: Watchtower pulls new digests of a TAG. With the
+  # default local `sift:latest` build it has nothing to pull.
+  # ───────────────────────────────────────────────────────────────────────────
+  watchtower:
+    image: containrrr/watchtower
+    container_name: sift-watchtower
+    profiles: ["autoupdate"]
+    restart: unless-stopped
+    environment:
+      # Only containers labelled watchtower.enable=true — never anything else on the host.
+      WATCHTOWER_LABEL_ENABLE: "true"
+      WATCHTOWER_CLEANUP: "true"
+      WATCHTOWER_INCLUDE_RESTARTING: "true"
+      WATCHTOWER_POLL_INTERVAL: ${SIFT_AUTOUPDATE_INTERVAL_SEC:-86400}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - sift_net
+
+networks:
+  sift_net:
+    driver: bridge
+
+volumes:
+  caddy_data:
+  caddy_config:

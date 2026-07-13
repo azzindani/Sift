@@ -1,0 +1,43 @@
+{
+  "$comment": [
+    "Two ways to connect. Pick one.",
+    "",
+    "1. 'sift' — REMOTE endpoint (recommended). Point any MCP client at a deployed",
+    "   Sift over HTTP with a bearer token, exactly like Folio. One box does the",
+    "   encoding; every client shares the same project library.",
+    "",
+    "2. 'sift-local' — self-updating stdio launch (STANDARDS §31). The command",
+    "   clone-guards on .git, git fetch + reset --hard, uv sync, then exec's the",
+    "   server, so the running code always matches origin. Requires ffmpeg on PATH.",
+    "",
+    "Tokens come from SIFT_TOKENS_FILE / SIFT_TOKENS / SIFT_API_KEY on the server.",
+    "Generate one with: openssl rand -hex 32",
+    "",
+    "The 600000 ms timeout covers a first launch (clone + uv sync). Renders are",
+    "async — render_clip returns a job_id immediately and never blocks a tool call."
+  ],
+  "mcpServers": {
+    "sift": {
+      "type": "http",
+      "url": "https://sift.example.com/mcp",
+      "headers": {
+        "Authorization": "Bearer sk-sift-replace-with-your-token"
+      },
+      "timeout": 600000
+    },
+    "sift-local": {
+      "command": "sh",
+      "args": [
+        "-c",
+        "d=\"$HOME/.mcp_servers/Sift\"; if [ ! -d \"$d/.git\" ]; then rm -rf \"$d\"; git clone https://github.com/azzindani/Sift.git \"$d\" --quiet; else cd \"$d\" && git fetch origin --quiet && git reset --hard FETCH_HEAD --quiet; fi; cd \"$d\" && uv sync --quiet && exec uv run python server.py --transport stdio"
+      ],
+      "env": {
+        "MCP_CONSTRAINED_MODE": "1",
+        "SIFT_PROJECTS_DIR": "",
+        "SIFT_BASE_URL": "http://localhost:8765/clips",
+        "SIFT_TTL_HOURS": "168"
+      },
+      "timeout": 600000
+    }
+  }
+}

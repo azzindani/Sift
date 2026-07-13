@@ -1,6 +1,6 @@
-# TOOLS.md — Clipper
+# TOOLS.md — Sift
 
-The MCP tool surface: 8 tools, pipeline-shaped. Every tool returns a dict with `success`
+The MCP tool surface: **9 tools**, pipeline-shaped. Every tool returns a dict with `success`
 first, a `progress` array, and `token_estimate` (STANDARDS §16). Docstrings are ≤80 chars
 (§11). Parameters use only allowed primitive types (§11). All file paths pass
 `resolve_path()` first (§18). The server does no inference — selection/labeling arrive as
@@ -15,12 +15,22 @@ Annotation legend (STANDARDS §12): `RO`=readOnlyHint, `D`=destructiveHint,
 
 ### `fetch_source` — network
 ```
-fetch_source(url: str, max_height: int = 720, cookies_path: str = "") -> dict
-"""Fetch source video + transcript by URL. Returns source metadata."""
+fetch_source(url: str, max_height: int = 720, cookies_path: str = "",
+             project: str = "default") -> dict
+"""Fetch video + transcript by URL into a project. Returns metadata."""
 ```
 - Annotations: RO=False, D=False, I=False, OW=True
-- Disk guard before download; URL dedup; `--sub-format json3`.
-- Returns `source_id`, `duration`, `transcript_kind` (`json3`/`vtt`/`none`), `title`.
+- **Async, and split in two.** The probe + disk guard + *transcript* happen inline
+  (seconds). The **video download is queued** on the same single worker that encodes, and
+  the tool returns immediately with a `download_job_id`.
+  A 3-hour source takes minutes to pull and an MCP client times out around 30 seconds, so a
+  synchronous fetch would simply never return over HTTP (STANDARDS §23).
+- The agent reads the transcript and picks candidates *while the video downloads* — the two
+  overlap instead of stacking. `render_clip` queues behind the download automatically,
+  because one worker drains the queue in order.
+- Refuses a source with **no captions before a single byte of video is pulled**.
+- Returns `source_id`, `project`, `duration`, `transcript_kind` (`json3`/`vtt`), `title`,
+  `chunk_count`, `download_job_id`, `video_ready`.
 - On bot challenge / throttle: `success=False`, `hint` → set `cookies_path` or proxy env.
 - Never returns the transcript body.
 
@@ -49,8 +59,19 @@ get_job(job_id: str) -> dict
 """Read render job status, progress, and output path."""
 ```
 - Annotations: RO=True, D=False, I=True, OW=False
+- Covers **both** job kinds — `kind` is `fetch` (source download) or `render` (encode).
 - Returns `status` (`queued`/`running`/`done`/`failed`), `elapsed_seconds`, `progress`,
   `output_path` when done, `error`+`hint` when failed.
+
+### `list_library`
+```
+list_library(project: str = "") -> dict
+"""List projects, or one project's sources, clips, and exports."""
+```
+- Annotations: RO=True, D=False, I=True, OW=False
+- No argument → every project with counts. With a project → its sources, clips, and
+  exports (including published links and whether each source's video is still on disk).
+- Reads the **files**, not the database. A project dropped in from a backup shows up.
 
 ---
 
@@ -121,5 +142,7 @@ pipeline shape. The standard's spirit is preserved:
 - **The agent is the intelligence:** scoring and labeling come in as arguments to
   `add_candidates`; no tool reasons about content.
 
-Tool count is 8 — under the §8 ceiling of 10. New clip *types* are added as labels + skills
+Tool count is 9 — under the §8 ceiling of 10. Discovery over the library costs exactly one
+tool: `list_library`. Project *creation* stays implicit (`fetch_source(url, project="ep42")`
+scaffolds it), so adding the library did not cost a second tool. New clip *types* are added as labels + skills
 (data), not new tools, so the surface stays fixed as the engine generalizes.
