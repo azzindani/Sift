@@ -10,6 +10,12 @@ The HTTP surface deliberately mirrors Folio's, so one client config style reache
     GET  /version         running version                                 [public]
     GET  /tokens/whoami   which named token you are                       [Bearer]
     GET  /clips/{b}/{f}   published clip, thumbnail, manifest, gallery    [Bearer]
+    *    /oauth/*         OAuth 2.0 + PKCE for claude.ai's connector      [public]
+    GET  /.well-known/oauth-*   RFC 8414 / RFC 9728 discovery             [public]
+
+The OAuth surface is not a second auth system — it is a bridge to the same one. The
+key pasted at /oauth/authorize is the same tokens.json entry a raw Bearer uses, and
+both resolve to the same named principal. One key, every platform. See shared/oauth.py.
 
 stdout is the MCP channel on stdio transport, so a single stray ``print`` corrupts the
 protocol stream. Logging is pinned to stderr here, once, for the whole process.
@@ -29,11 +35,18 @@ from fastmcp import FastMCP
 from starlette.datastructures import Headers
 from starlette.middleware import Middleware
 from starlette.requests import Request
-from starlette.responses import FileResponse, JSONResponse, Response
+from starlette.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+    Response,
+)
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 import engine
 from _clip_helpers import serve_dir
+from shared import oauth
 from shared.auth import (
     OPEN_PRINCIPAL,
     AuthConfigError,
@@ -43,6 +56,7 @@ from shared.auth import (
     rate_limiter_from_env,
 )
 from shared.file_utils import PathError, resolve_path
+from shared.oauth import OAUTH_PATH_PREFIXES
 from shared.platform_utils import check_toolchain
 
 VERSION = "0.1.0"
@@ -201,6 +215,22 @@ _MEDIA_TYPES = {
 _limiter = rate_limiter_from_env()
 
 
+def _base_url(scope: Scope) -> str:
+    """The public origin, as the *client* sees it.
+
+    Behind Caddy the app listens on plain HTTP, so deriving this from the socket would
+    advertise ``http://sift:8765`` in the OAuth metadata — and claude.ai would then send
+    the browser to an unreachable internal host. The forwarded headers are the only
+    truth here, which is why the Caddy block sets X-Forwarded-Proto / -Host explicitly.
+    """
+    headers = Headers(scope=scope)
+    proto = headers.get("x-forwarded-proto", "").split(",")[0].strip()
+    host = headers.get("x-forwarded-host", "") or headers.get("host", "")
+    if not proto:
+        proto = "https" if scope.get("scheme") in ("https", "wss") else "http"
+    return f"{proto}://{host or 'localhost'}"
+
+
 class AuthMiddleware:
     """Bearer auth + per-(token, IP) rate limiting. Everything but /health and /version.
 
@@ -222,22 +252,33 @@ class AuthMiddleware:
             return
 
         path = scope.get("path", "")
-        if path in PUBLIC_PATHS or scope.get("method") == "OPTIONS":
+        # The OAuth handshake IS the pre-auth path: claude.ai walks discovery,
+        # registration and PKCE anonymously, before it holds any token at all. Gating
+        # these behind the bearer would make the connector impossible to add.
+        if (
+            path in PUBLIC_PATHS
+            or path.startswith(OAUTH_PATH_PREFIXES)
+            or scope.get("method") == "OPTIONS"
+        ):
             await self.app(scope, receive, send)
             return
 
         headers = Headers(scope=scope)
         principal = authorize(headers.get("authorization"))
         if principal is None:
-            # No WWW-Authenticate header: a browser popup cannot satisfy a bearer token,
-            # so prompting for one would only confuse. Say what is missing instead.
+            # RFC 9728: point the client at the resource metadata so an MCP client that
+            # does not yet have a token can discover *where* to get one. This header is
+            # how claude.ai finds the OAuth surface from a bare 401.
+            resource = f"{_base_url(scope)}/.well-known/oauth-protected-resource"
             response = JSONResponse(
                 {
                     "error": "unauthorized",
                     "hint": "Send 'Authorization: Bearer <token>'. Tokens come from "
-                    "SIFT_TOKENS_FILE / SIFT_TOKENS / SIFT_API_KEY.",
+                    "SIFT_TOKENS_FILE / SIFT_TOKENS / SIFT_API_KEY, or complete the "
+                    "OAuth flow at /oauth/authorize.",
                 },
                 status_code=401,
+                headers={"WWW-Authenticate": f'Bearer resource_metadata="{resource}"'},
             )
             await response(scope, receive, send)
             return
@@ -316,6 +357,83 @@ async def whoami(request: Request) -> Response:
     """Which named token you presented. The cheapest possible auth sanity check."""
     principal = request.scope.get("principal", OPEN_PRINCIPAL)
     return JSONResponse({"token": principal, "authenticated": principal != OPEN_PRINCIPAL})
+
+
+# ── OAuth 2.0 + PKCE ─────────────────────────────────────────────────────────────
+# All public: this is the handshake a client runs BEFORE it holds a token. claude.ai's
+# Custom Connector will not accept a raw bearer, so without these Sift simply cannot be
+# added to claude.ai. The key you paste at /oauth/authorize is the SAME tokens.json key
+# you use from Claude Code or curl — see shared/oauth.py.
+
+_CORS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+}
+
+
+async def _capped_body(request: Request) -> bytes:
+    """Read a pre-auth body under a hard cap — an anon POST must not OOM the box."""
+    body = b""
+    async for chunk in request.stream():
+        body += chunk
+        if len(body) > oauth.MAX_BODY_BYTES:
+            raise ValueError("body too large")
+    return body
+
+
+@mcp.custom_route("/.well-known/oauth-authorization-server", methods=["GET", "OPTIONS"])
+async def oauth_metadata(request: Request) -> Response:
+    """RFC 8414 — where the authorize and token endpoints live."""
+    return JSONResponse(oauth.metadata(_base_url(request.scope)), headers=_CORS)
+
+
+@mcp.custom_route("/.well-known/oauth-protected-resource", methods=["GET", "OPTIONS"])
+async def oauth_resource(request: Request) -> Response:
+    """RFC 9728 — what the 401's WWW-Authenticate header points at."""
+    return JSONResponse(oauth.protected_resource(_base_url(request.scope)), headers=_CORS)
+
+
+@mcp.custom_route("/oauth/register", methods=["POST", "OPTIONS"])
+async def oauth_register(request: Request) -> Response:
+    """RFC 7591 dynamic client registration — claude.ai registers itself here."""
+    try:
+        body = await _capped_body(request)
+    except ValueError:
+        return JSONResponse({"error": "invalid_request"}, status_code=413, headers=_CORS)
+    status, payload = oauth.register(body)
+    return JSONResponse(payload, status_code=status, headers=_CORS)
+
+
+@mcp.custom_route("/oauth/authorize", methods=["GET"])
+async def oauth_authorize_get(request: Request) -> Response:
+    """The login form. The one human step: paste your Sift key."""
+    status, page = oauth.authorize_form(dict(request.query_params))
+    return HTMLResponse(page, status_code=status, headers=_CORS)
+
+
+@mcp.custom_route("/oauth/authorize", methods=["POST", "OPTIONS"])
+async def oauth_authorize_post(request: Request) -> Response:
+    """Validate the pasted key, mint a one-shot code, bounce back to the client."""
+    try:
+        body = await _capped_body(request)
+    except ValueError:
+        return HTMLResponse("too large", status_code=413, headers=_CORS)
+    status, page, location = oauth.authorize_submit(body)
+    if status == 302:
+        return RedirectResponse(location, status_code=302, headers=_CORS)
+    return HTMLResponse(page, status_code=status, headers=_CORS)
+
+
+@mcp.custom_route("/oauth/token", methods=["POST", "OPTIONS"])
+async def oauth_token(request: Request) -> Response:
+    """Exchange the code (PKCE-verified) for an access token, or rotate a refresh token."""
+    try:
+        body = await _capped_body(request)
+    except ValueError:
+        return JSONResponse({"error": "invalid_request"}, status_code=413, headers=_CORS)
+    status, payload = oauth.token(body)
+    return JSONResponse(payload, status_code=status, headers=_CORS)
 
 
 @mcp.custom_route("/clips/{batch_id}/{filename}", methods=["GET", "HEAD"])

@@ -54,8 +54,14 @@ def test_mcp_requires_a_bearer_token(client):
     response = client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
     assert response.status_code == 401
     assert "Bearer" in response.json()["hint"]
-    # No WWW-Authenticate: a browser password prompt cannot satisfy a bearer token.
-    assert "www-authenticate" not in {k.lower() for k in response.headers}
+    # WWW-Authenticate carries RFC 9728 resource metadata, NOT a browser challenge.
+    # This is how an MCP client holding no token discovers where to get one — it is
+    # what lets claude.ai find the OAuth surface from a bare 401. (An earlier version
+    # deliberately omitted the header, reasoning that a browser password prompt cannot
+    # satisfy a bearer. True, and beside the point: the consumer here is a connector.)
+    challenge = response.headers["www-authenticate"]
+    assert challenge.startswith("Bearer resource_metadata=")
+    assert "/.well-known/oauth-protected-resource" in challenge
 
 
 def test_mcp_rejects_a_wrong_token(client):
