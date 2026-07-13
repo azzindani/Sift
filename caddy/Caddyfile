@@ -1,0 +1,50 @@
+# Caddy reverse proxy + automatic HTTPS for Sift.
+#
+# Variables (set in .env, read by docker-compose.yml):
+#   SIFT_DOMAIN      — public domain pointing at this VPS (DNS A record)
+#   SIFT_ACME_EMAIL  — contact email for Let's Encrypt registration
+#
+# Routing:
+#   /mcp             → sift:8765   MCP JSON-RPC (Streamable HTTP)   [Bearer]
+#   /tokens/whoami   → sift:8765   token sanity check                [Bearer]
+#   /clips/*         → sift:8765   published clips + galleries       [Bearer]
+#   /health          → sift:8765   liveness                          [public]
+#   /version         → sift:8765   running version                   [public]
+#
+# Caddy terminates TLS and forwards `Authorization: Bearer` untouched — the app
+# is the sole auth gate, exactly as in Folio. There is deliberately no Basic Auth
+# anywhere: a browser username/password popup cannot satisfy a bearer token, so
+# adding one would only produce a prompt no agent can answer.
+#
+# /health and /version bypass auth so a monitor can alert on a dead or stale
+# deployment without holding an API token. Neither ever echoes a token value.
+{
+	email {$SIFT_ACME_EMAIL}
+}
+
+{$SIFT_DOMAIN} {
+	encode zstd gzip
+
+	# MCP + everything the app gates itself. flush_interval -1 disables response
+	# buffering, which Streamable HTTP's SSE replies need to arrive incrementally
+	# rather than all at once when the stream closes.
+	reverse_proxy sift:8765 {
+		flush_interval -1
+		header_up Host {host}
+		header_up X-Forwarded-Proto {scheme}
+		header_up X-Forwarded-Host {host}
+
+		# A render is async (the tool returns a job_id immediately), so no request
+		# should ever be long — but a large clip download over /clips can be. Give
+		# the transfer room without letting a dead backend hang forever.
+		transport http {
+			read_timeout 10m
+			write_timeout 10m
+		}
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}
