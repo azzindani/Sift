@@ -99,6 +99,15 @@ services:
     networks:
       - sift_net
 
+    # Docker's embedded DNS resolver can return AAAA records but drop the A record for a
+    # host — and a default bridge network has no IPv6 route. yt-dlp then fails with
+    # "Network is unreachable", or with "No remote IPv4 addresses available" if you pin it
+    # to IPv4. Verified: inside the container www.ted.com resolved to IPv6 *only*, while the
+    # host got both. Real resolvers fix it. Override with SIFT_DNS if your network needs it.
+    dns:
+      - ${SIFT_DNS1:-1.1.1.1}
+      - ${SIFT_DNS2:-8.8.8.8}
+
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8765/health >/dev/null || exit 1"]
       interval: 30s

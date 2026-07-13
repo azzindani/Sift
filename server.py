@@ -256,17 +256,42 @@ class AuthMiddleware:
         await self.app(scope, receive, send)
 
 
+def _egress() -> dict[str, Any]:
+    """Can this host actually reach a video source over IPv4?
+
+    Worth a line in /health because the failure is otherwise invisible and baffling:
+    Docker's embedded DNS can hand back an AAAA record and drop the A record, while the
+    bridge network has no IPv6 route — so yt-dlp fails with "Network is unreachable" on a
+    URL that works perfectly from the host. Surfacing the resolved families here turns a
+    twenty-minute debug into a glance.
+    """
+    import socket  # noqa: PLC0415 - only the health route needs it
+
+    try:
+        infos = socket.getaddrinfo("www.youtube.com", 443, proto=socket.IPPROTO_TCP)
+        families = sorted({"ipv4" if i[0] == socket.AF_INET else "ipv6" for i in infos})
+        return {
+            "dns": "ok",
+            "families": families,
+            "ipv4": "ipv4" in families,
+        }
+    except OSError as exc:
+        return {"dns": f"FAILED — {exc}", "families": [], "ipv4": False}
+
+
 @mcp.custom_route("/health", methods=["GET"])
 async def healthz(_: Request) -> Response:
-    """Liveness — public. Reports the toolchain the render path depends on."""
+    """Liveness — public. Reports the toolchain and egress the pipeline depends on."""
     toolchain = check_toolchain()
-    healthy = not any(v.startswith("MISSING") for v in toolchain.values())
+    egress = _egress()
+    healthy = not any(v.startswith("MISSING") for v in toolchain.values()) and egress["ipv4"]
     return JSONResponse(
         {
             "ok": healthy,
             "version": VERSION,
             "auth": describe_auth(),
             "toolchain": toolchain,
+            "egress": egress,
             **engine.capabilities(),
         },
         status_code=200 if healthy else 503,
