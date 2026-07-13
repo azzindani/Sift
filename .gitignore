@@ -1,0 +1,29 @@
+# Claude Code project state (per-machine)
+.claude/
+
+# Environment + secrets
+.env
+.env.*
+!.env.example
+
+# Python / uv
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# Secrets — tokens.example.json is committed, tokens.json is NOT
+tokens.json
+
+# Runtime artifacts — sources are disposable, outputs are served
+.sift/
+served/
+tmp/
+sift-projects/
+sift-data/
+*.db
+*.db-wal
+*.db-shm
+*.mcp_receipt.jsonl
+.mcp_versions/

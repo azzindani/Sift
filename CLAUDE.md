@@ -63,12 +63,17 @@ Clipper/
 ├── _clip_render.py            # ffmpeg: cut, trim-silence, reframe, caption, thumbnail
 ├── _clip_queue.py             # SQLite job queue, single render worker, restart reconcile
 ├── _clip_publish.py           # move to served dir, build manifest + summary + links
-├── shared/                    # version_control, file_utils, platform_utils, progress, receipt
+├── _clip_library.py           # Folio-style project library — YAML is the record
+├── shared/                    # version_control, file_utils, platform_utils, progress, receipt, auth
+├── skills/                    # one procedural prompt per label — the agent reads these
+│   ├── README.md              # how a label pulls a skill; how to add a clip type
+│   └── quote|joke|story|argument|hot_take|reaction.md
 ├── assets/
-│   └── fonts/                 # bundled caption font(s) — referenced by path, never system-resolved
+│   └── fonts/                 # bundled caption font — referenced by path, never system-resolved
 ├── tests/
-│   ├── fixtures/              # real transcripts (json3 + vtt), short test clips
-│   └── test_engine.py
+│   ├── fixtures/              # transcripts (json3 + vtt, incl. rolling-caption VTT)
+│   ├── conftest.py            # isolated data dir; synthetic source video built by ffmpeg
+│   └── test_engine.py         # 44 tests; render tests run real ffmpeg, nothing mocked
 ├── install/
 │   ├── install.sh             # POSIX sh
 │   └── install.bat
@@ -78,13 +83,34 @@ Clipper/
 │   ├── TOOLS.md               # the 8-tool surface, schemas, annotations, contracts
 │   ├── LABELS_AND_SKILLS.md   # intent label registry + skill injection design
 │   └── OUTPUT_CONTRACT.md     # manifest, summary, link lifecycle, retention
+├── Dockerfile                 # python3.12-slim + ffmpeg, non-root, tini, healthcheck
+├── docker-compose.yml         # sift + caddy (tls profile) + watchtower (autoupdate profile)
+├── caddy/Caddyfile            # TLS termination; forwards Bearer untouched
+├── .env.example               # every knob, documented
+├── tokens.example.json        # named bearer tokens (tokens.json is gitignored)
+├── .github/workflows/
+│   ├── ci.yml                 # lint, format, contracts, tests, docker build + smoke
+│   └── release.yml            # tag -> GHCR (amd64 + arm64) + GitHub release
+├── mcp.json                   # remote HTTP endpoint + self-updating stdio launch
 ├── pyproject.toml             # requires-python = "==3.12.*", fastmcp pinned
 ├── uv.lock
 ├── .python-version
 ├── CLAUDE.md                  # this file
-├── STANDARDS.md               # copy of the org standard (reference)
+├── LICENSE                    # MIT + the bundled font's OFL notice
 └── README.md
 ```
+
+**The library** (`SIFT_PROJECTS_DIR`, default `~/.sift/projects`) is the durable record —
+YAML you can read, diff, and hand-edit. See `_clip_library.py` for the layout.
+
+**Runtime state** (`SIFT_DATA_DIR`, gitignored, rebuildable): `sift.db` holds *only* the job
+queue and an entity→project index. The index is **derived, never authoritative**: delete the
+DB and it repopulates from the files on next boot. `tmp/jobs/<id>/` is per-render scratch;
+`served/<batch>/` is a TTL'd *view* onto the library, not the record.
+
+**Note on the org standard:** `STANDARDS.md` is not vendored here. It lives upstream and is
+split across `STANDARDS.md` / `TOOLS.md` / `RUNTIME.md`; a stale local copy would be worse
+than a link. See the reference at the top of this file.
 
 **Document index — read these for detail:**
 
@@ -200,28 +226,87 @@ no `eval`/`exec`, `shell=False`, `resolve_path` first, ≤10 tools, no business 
 - [x] OUTPUT_CONTRACT.md
 
 ### Phase 1 — Skeleton + fetch
-- [ ] Repo scaffold, `pyproject.toml` (`==3.12.*`, fastmcp pinned), `uv sync`
-- [ ] `shared/` modules (file_utils with `resolve_path`, progress, receipt, platform_utils)
-- [ ] `_clip_fetch.py`: yt-dlp source @ capped resolution + `--sub-format json3`, disk guard, URL dedup
-- [ ] `fetch_source` + `read_transcript_chunk` tools, transcript word-timing parse
-- [ ] Tests: fetch metadata, chunk overlap, json3 + vtt fixtures, no-caption error path
+- [x] Repo scaffold, `pyproject.toml` (`==3.12.*`, fastmcp pinned), `uv sync`
+- [x] `shared/` modules (file_utils with `resolve_path`, progress, receipt, platform_utils)
+- [x] `_clip_fetch.py`: yt-dlp source @ capped resolution + `--sub-format json3`, disk guard, URL dedup
+- [x] `fetch_source` + `read_transcript_chunk` tools, transcript word-timing parse
+- [x] Tests: chunk overlap, json3 + vtt fixtures, rolling-caption dedup, no-caption error path
 
 ### Phase 2 — Selection + plan
-- [ ] `_clip_select.py`: `add_candidates` (validate, dedup/merge), `plan_clips` (group by label)
-- [ ] Label registry + skill files (see LABELS_AND_SKILLS.md)
-- [ ] `sample_frames` tool (budget-capped) for the agent's vision pass
-- [ ] Tests: dedup/merge boundaries, grouping, frame budget enforcement
+- [x] `_clip_select.py`: `add_candidates` (validate, dedup/merge), `plan_clips` (group by label)
+- [x] Label registry + skill files (see LABELS_AND_SKILLS.md)
+- [x] `sample_frames` tool (budget-capped) for the agent's vision pass
+- [x] Tests: dedup/merge boundaries, grouping, frame budget enforcement
 
 ### Phase 3 — Render + queue
-- [ ] `_clip_queue.py`: SQLite job queue, single worker, restart reconciliation
-- [ ] `_clip_render.py`: silencedetect trim, single-cut, multi-cut w/ acrossfade+xfade,
+- [x] `_clip_queue.py`: SQLite job queue, single worker, restart reconciliation
+- [x] `_clip_render.py`: silencedetect trim, single-cut, multi-cut w/ acrossfade+xfade,
       9:16 reframe + MediaPipe crop smoothing, ASS caption burn-in, thumbnail
-- [ ] `render_clip` (async enqueue) + `get_job` tools
-- [ ] Tests: trim correctness, crop smoothing stability, caption sync, encode serialization
+- [x] `render_clip` (async enqueue) + `get_job` tools
+- [x] Tests: trim correctness, crop smoothing stability, caption sync, encode serialization
 
 ### Phase 4 — Publish + ship
-- [ ] `_clip_publish.py`: served dir, manifest + verifiable summary, TTL cleanup
-- [ ] `publish_outputs` tool
-- [ ] HTTP transport, mcp.json (self-updating), install scripts, Caddy/serve config
-- [ ] README per STANDARDS §35 (VPS-adapted), CI (lint/format/pyright/docstring/test)
-- [ ] End-to-end test on the 2c/4GB VPS: one 2h source → ≥5 clips → links + summary
+- [x] `_clip_publish.py`: served dir, manifest + verifiable summary, TTL cleanup
+- [x] `publish_outputs` tool
+- [x] HTTP transport, mcp.json (self-updating), install scripts, static `/clips` route
+- [x] README per STANDARDS §35 (VPS-adapted), CI (lint/format/tool-contract/no-stdout/size/test)
+- [x] **Verified against a live source** — fetched an 18-min TED talk (yt-dlp → VTT → 382
+      segments), planned a 6-member supercut, face-followed, captioned, published. YouTube
+      bot-challenges this IP, which exercised the cookies/proxy error path for real.
+- [ ] End-to-end on the real 2c/4GB VPS with a full 2h source (this box is 4c/16GB).
+
+### What the live runs taught us (bugs no synthetic fixture would have found)
+
+**From the containerized HTTP deployment:**
+
+5. **FastMCP runs a *sync* tool body on the event loop** (`FunctionTool.run` →
+   `type_adapter.validate_python`, no thread offload). Every tool here does blocking I/O and
+   `fetch_source` can sit in a yt-dlp probe for fifteen seconds. On the loop that stalls health
+   checks, in-flight SSE streams, and every other client — on a shared endpoint it is an outage,
+   not a slow call. Every tool body is now `async def` + `anyio.to_thread`.
+6. **`fetch_source` was synchronous and took minutes.** An MCP client times out around 30s, so
+   it simply never returned over HTTP (STANDARDS §23). Split: probe + disk guard + *transcript*
+   inline (seconds); the **video download is queued** on the same worker that encodes. The agent
+   now reads and selects *while the video downloads* — the two overlap instead of stacking.
+7. **Starlette's `BaseHTTPMiddleware` buffers streaming responses**, which deadlocks MCP's
+   Streamable HTTP SSE replies on any long call. The auth middleware is pure ASGI.
+8. **Docker's embedded DNS dropped the A record** for `www.ted.com` and returned AAAA only,
+   while the bridge network has no IPv6 route — so yt-dlp could not connect at all, on a URL
+   that worked from the host. Compose sets real resolvers; `/health` now reports the resolved
+   address families and 503s without an IPv4 route.
+9. **TED intermittently serves a 0-byte HLS variant** ("The downloaded file is empty") and an
+   **empty caption list**. Both are transient and both were being believed: the first left an
+   empty file that a `glob` could hand to the encoder, the second told the agent "this source
+   has no captions" — a dead end, not a retry. Both are now retried, and the video is chosen by
+   size, not glob order.
+
+**From the first live fetch (four bugs):**
+
+1. **Real VTT omits the blank-line cue separator.** TED does it before 35 of 415 cues. A
+   block-splitting parser swallows those cues and leaks raw `-->` timestamps into the caption
+   text. `parse_vtt` now scans line by line: a timing line always starts a new cue.
+2. **`concat` and `fps` emit different timebases** (1/1000000 vs 1/30) and `xfade` refuses to
+   join links whose timebases differ. A clip whose members happen to share a shape works by
+   luck; mix a dead-air-trimmed member with an untrimmed one and the encode dies.
+3. **A source can change resolution mid-stream.** TED's mp4 declares 854x480 in the header, but
+   31,899 of its 31,982 frames are 640x480 — only the branded intro is 854. Sizing the crop from
+   the header computes the reframe against a resolution 99.7% of the video does not have, and the
+   mid-stream change reinitializes the filter graph, which `concat`/`xfade` do not survive.
+   Dimensions now come from a decoded frame at the midpoint, not the container header.
+4. **`[0:v]trim=start=888` decodes the whole source.** Fine on an 18-min talk, fatal on a 4-hour
+   podcast on two vCPUs. Segments are now cut with input seeking (`-ss` before `-i`) into
+   normalized intermediates, then assembled — cost scales with the clip, not the source.
+
+### Known gaps / next up
+- [ ] `by_topic` clustering is keyword-overlap only (Jaccard over content words). Good enough for
+      "every money mention"; it will not cluster paraphrases. An agent grouping pass would.
+- [ ] No auth on the HTTP transport. Served paths are unguessable, but anyone who has a link has
+      the clip. Front with Caddy + auth if that matters.
+- [ ] `stacked` (two-shot) has still never seen a real two-speaker source — the TED talk is a
+      single presenter, so only the fall-back-to-speaker path has run for real.
+- [ ] Distant-moment splicing across a source (v2, gated behind a coherence check) — v1 multi-cut
+      only removes dead air inside a span and crossfades between planned members.
+- [ ] **Folio-style project library** (`~/.sift/projects/<project>/`, YAML as the record, one new
+      `list_library` tool → 9 total). Agreed shape: durable clips/transcripts/candidates/manifests,
+      **disposable sources** (a 3h source is ~2.7 GB; twenty would fill the disk). SQLite demoted
+      to job-queue-only.

@@ -1,0 +1,68 @@
+{
+  "wireMagic": "pb3",
+  "pens": [{}],
+  "wsWinStyles": [{}],
+  "wpWinPositions": [{}],
+  "events": [
+    {"tStartMs": 0, "dDurationMs": 5000, "wWinId": 1, "wpWinPosId": 1},
+    {"tStartMs": 500, "dDurationMs": 4200, "segs": [
+      {"utf8": "The", "tOffsetMs": 0},
+      {"utf8": " ", "tOffsetMs": 0},
+      {"utf8": "thing", "tOffsetMs": 320},
+      {"utf8": " nobody", "tOffsetMs": 700},
+      {"utf8": " tells", "tOffsetMs": 1250},
+      {"utf8": " you", "tOffsetMs": 1600},
+      {"utf8": " about", "tOffsetMs": 1900},
+      {"utf8": " funding", "tOffsetMs": 2400},
+      {"utf8": " is", "tOffsetMs": 3100},
+      {"utf8": " simple.", "tOffsetMs": 3400}
+    ]},
+    {"tStartMs": 5200, "dDurationMs": 4600, "segs": [
+      {"utf8": "You", "tOffsetMs": 0},
+      {"utf8": " raise", "tOffsetMs": 400},
+      {"utf8": " money", "tOffsetMs": 900},
+      {"utf8": " to", "tOffsetMs": 1400},
+      {"utf8": " buy", "tOffsetMs": 1650},
+      {"utf8": " time,", "tOffsetMs": 2000},
+      {"utf8": " not", "tOffsetMs": 2700},
+      {"utf8": " to", "tOffsetMs": 3050},
+      {"utf8": " buy", "tOffsetMs": 3300},
+      {"utf8": " growth.", "tOffsetMs": 3700}
+    ]},
+    {"tStartMs": 12000, "dDurationMs": 4800, "segs": [
+      {"utf8": "And", "tOffsetMs": 0},
+      {"utf8": " that", "tOffsetMs": 300},
+      {"utf8": " is", "tOffsetMs": 620},
+      {"utf8": " why", "tOffsetMs": 900},
+      {"utf8": " he", "tOffsetMs": 1300},
+      {"utf8": " walked", "tOffsetMs": 1700},
+      {"utf8": " away", "tOffsetMs": 2300},
+      {"utf8": " from", "tOffsetMs": 2800},
+      {"utf8": " the", "tOffsetMs": 3200},
+      {"utf8": " deal.", "tOffsetMs": 3500}
+    ]},
+    {"tStartMs": 22000, "dDurationMs": 5000, "segs": [
+      {"utf8": "[laughter]", "tOffsetMs": 0}
+    ]},
+    {"tStartMs": 32000, "dDurationMs": 5200, "segs": [
+      {"utf8": "I", "tOffsetMs": 0},
+      {"utf8": " completely", "tOffsetMs": 300},
+      {"utf8": " disagree", "tOffsetMs": 1100},
+      {"utf8": " with", "tOffsetMs": 1900},
+      {"utf8": " that", "tOffsetMs": 2300},
+      {"utf8": " framing", "tOffsetMs": 2700},
+      {"utf8": " of", "tOffsetMs": 3400},
+      {"utf8": " funding.", "tOffsetMs": 3700}
+    ]},
+    {"tStartMs": 42000, "dDurationMs": 4900, "segs": [
+      {"utf8": "Every", "tOffsetMs": 0},
+      {"utf8": " founder", "tOffsetMs": 500},
+      {"utf8": " I", "tOffsetMs": 1100},
+      {"utf8": " know", "tOffsetMs": 1350},
+      {"utf8": " raised", "tOffsetMs": 1800},
+      {"utf8": " money", "tOffsetMs": 2400},
+      {"utf8": " for", "tOffsetMs": 2900},
+      {"utf8": " growth.", "tOffsetMs": 3300}
+    ]}
+  ]
+}
