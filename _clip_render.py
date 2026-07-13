@@ -29,6 +29,14 @@ from _clip_helpers import (
     get_encode_threads,
     get_max_clip_s,
 )
+from _clip_reframe import (
+    OUT_H,
+    OUT_W,
+    crop_width,
+    enable_expr,
+    fit_chain,
+    follow_chain,
+)
 from _clip_transcript import (
     FONT_FILE,
     build_ass_lines,
@@ -43,14 +51,16 @@ SILENCE_TIMEOUT_S = 300.0
 ENCODE_TIMEOUT_S = 1800.0
 SEGMENT_TIMEOUT_S = 600.0
 THUMB_TIMEOUT_S = 60.0
-FACE_SAMPLE_TIMEOUT_S = 300.0
 
 CROSSFADE_S = 0.15  # member-to-member join; video and audio must use the SAME value
 MIN_SEGMENT_S = 0.25
 MICRO_FADE_S = 0.02  # kills the click at a hard concat join
 
-OUT_W = 1080
-OUT_H = 1920
+# A cut has to earn its keep. After padding, a "drop" can shrink to almost nothing — a
+# 0.62s silence with 250ms of pad on each side removes 0.12s — and the result is a hard
+# jump cut that saves a tenth of a second. Below this, leave the pause alone.
+MIN_DROP_S = 0.25
+
 OUT_FPS = 30
 AUDIO_RATE = 44100
 
@@ -58,25 +68,6 @@ AUDIO_RATE = 44100
 # bundled font gets its own subdirectory. Point it at the job temp dir and it tries to
 # load cap.ass and filtergraph.txt as fonts.
 FONTS_SUBDIR = "fonts"
-
-FACE_SAMPLE_FPS = 2.0
-MAX_FACE_SAMPLES = 240
-MAX_CROP_KEYPOINTS = 40
-SMOOTH_WINDOW = 5  # samples in the moving average
-MAX_PAN_PX_PER_S = 90.0  # within a shot the crop glides, never snaps
-
-# ...but ACROSS a shot cut it must snap, and that is a different thing entirely.
-# A multi-camera source (every talk, every interview) cuts between a wide shot and a
-# close-up. The subject's position then jumps hundreds of pixels in one frame. Treating
-# that as camera *movement* means the moving average blends the two shots together and
-# the pan cap crawls toward the new position at 90 px/s — so for the ~1-3 seconds after
-# every cut the speaker is mis-framed or sliced by the frame edge. Verified on a TED
-# talk: at the wide->close-up cut, her face sat half outside the crop for a full second.
-#
-# A jump larger than this fraction of the frame width between two samples 125 ms apart is
-# not a person moving. It is the camera changing.
-CUT_JUMP_FRAC = 0.12
-SNAP_S = 0.04  # hold the old framing until one frame before the cut, then jump
 
 
 class RenderError(Exception):
@@ -219,7 +210,7 @@ def keep_segments(
         if hi - lo <= drop_threshold_s:
             continue
         lo, hi = lo + pad_s, hi - pad_s
-        if hi - lo > 0.1:
+        if hi - lo >= MIN_DROP_S:
             drops.append((lo, hi))
 
     segments: list[tuple[float, float]] = []
@@ -293,256 +284,6 @@ def build_timeline(
     timeline.duration = round(out_cursor, 3)
     timeline.members = len({seg.member for seg in timeline.segments})
     return timeline
-
-
-# --------------------------------------------------------------------------
-# Reframe — geometry is local and deterministic (MediaPipe), never an API call
-# --------------------------------------------------------------------------
-
-
-def _crop_width(src_w: int, src_h: int) -> int:
-    """Widest 9:16 column that fits, rounded to an even width."""
-    want = int(src_h * 9 / 16)
-    return max(2, min(want, src_w) // 2 * 2)
-
-
-def detect_faces(video: Path, timeline: Timeline, temp: Path) -> list[tuple[float, float]]:
-    """Face-centre x (in source pixels) over time, as (source_time, x) samples.
-
-    Returns [] when MediaPipe is unavailable or finds nothing — the caller then
-    degrades to a centred crop rather than failing the render.
-    """
-    try:
-        import mediapipe as mp  # noqa: PLC0415 - lazy: ~300 MB, render path only
-        import numpy as np  # noqa: PLC0415
-        from PIL import Image  # noqa: PLC0415
-    except ImportError as exc:
-        log.info("MediaPipe unavailable (%s) — falling back to a centred crop", exc)
-        return []
-
-    frames_dir = temp / "faces"
-    frames_dir.mkdir(parents=True, exist_ok=True)
-
-    # One ffmpeg call per kept segment, not per frame: on a 2-core box, 120 process
-    # launches cost more than the decode they were meant to avoid. Dropped air is never
-    # sampled — there is nothing there to follow.
-    budget = MAX_FACE_SAMPLES
-    sampled: list[tuple[float, Path]] = []
-
-    for index, seg in enumerate(timeline.segments):
-        if budget <= 0:
-            break
-        wanted = min(int(seg.duration * FACE_SAMPLE_FPS) + 1, budget)
-        if wanted <= 0:
-            continue
-
-        result = run(
-            [
-                ffmpeg_bin(),
-                "-hide_banner",
-                "-nostdin",
-                "-y",
-                "-ss",
-                f"{seg.src_start:.3f}",
-                "-to",
-                f"{seg.src_end:.3f}",
-                "-i",
-                str(video),
-                "-vf",
-                f"fps={FACE_SAMPLE_FPS},scale=480:-2",
-                "-frames:v",
-                str(wanted),
-                "-q:v",
-                "5",
-                str(frames_dir / f"s{index:02d}_%04d.jpg"),
-            ],
-            timeout=FACE_SAMPLE_TIMEOUT_S,
-        )
-        if not result.ok:
-            log.warning(
-                "face frame extraction failed on segment %d: %s", index, result.stderr[-200:]
-            )
-            continue
-
-        for frame in sorted(frames_dir.glob(f"s{index:02d}_*.jpg")):
-            # ffmpeg's fps filter emits frames on a fixed grid from the seek point.
-            offset = (int(frame.stem.split("_")[-1]) - 1) / FACE_SAMPLE_FPS
-            src_t = min(seg.src_start + offset, seg.src_end)
-            sampled.append((src_t, frame))
-            budget -= 1
-
-    samples: list[tuple[float, float]] = []
-    detector = mp.solutions.face_detection.FaceDetection(
-        model_selection=1, min_detection_confidence=0.5
-    )
-    try:
-        for src_t, frame in sampled:
-            with Image.open(frame) as img:
-                array = np.asarray(img.convert("RGB"))
-            detection = detector.process(array)
-            if not detection.detections:
-                continue
-            # Largest face wins — the active speaker is usually the biggest in frame.
-            best = max(
-                detection.detections,
-                key=lambda d: d.location_data.relative_bounding_box.width
-                * d.location_data.relative_bounding_box.height,
-            )
-            box = best.location_data.relative_bounding_box
-            samples.append((src_t, box.xmin + box.width / 2))  # relative x centre, 0..1
-    finally:
-        detector.close()
-        shutil.rmtree(frames_dir, ignore_errors=True)
-
-    log.info("face detection: %d sample(s) from %d frame(s)", len(samples), len(sampled))
-    return samples
-
-
-def smooth_centers(
-    samples: list[tuple[float, float]], src_w: int, crop_w: int, timeline: Timeline
-) -> list[tuple[float, float]]:
-    """Smooth face centres, cap pan speed, and remap onto the output timeline.
-
-    Returns (output_time, crop_x) keypoints. Jitter is what makes an auto-reframe
-    look cheap, so the moving average and the pan-speed cap are not optional.
-    """
-    if not samples:
-        return []
-
-    mapped: list[tuple[float, float]] = []
-    for src_t, rel_x in samples:
-        out_t = timeline.map_time(src_t)
-        if out_t is None:
-            continue
-        centre_px = rel_x * src_w
-        crop_x = centre_px - crop_w / 2
-        mapped.append((out_t, max(0.0, min(crop_x, float(src_w - crop_w)))))
-    if not mapped:
-        return []
-    mapped.sort(key=lambda p: p[0])
-
-    # Smooth and cap WITHIN each shot; snap between them. Doing this across a cut is what
-    # slices the speaker in half for a second after every camera change.
-    capped: list[tuple[float, float]] = []
-    for shot in _split_at_cuts(mapped, src_w):
-        smoothed: list[tuple[float, float]] = []
-        for i, (out_t, _) in enumerate(shot):
-            lo = max(0, i - SMOOTH_WINDOW // 2)
-            hi = min(len(shot), i + SMOOTH_WINDOW // 2 + 1)
-            window = [x for _, x in shot[lo:hi]]
-            smoothed.append((out_t, sum(window) / len(window)))
-
-        # Pan-speed cap: inside a shot the crop glides toward the target.
-        glided: list[tuple[float, float]] = [smoothed[0]]
-        for out_t, target in smoothed[1:]:
-            prev_t, prev_x = glided[-1]
-            max_delta = MAX_PAN_PX_PER_S * max(out_t - prev_t, 1e-3)
-            delta = max(-max_delta, min(target - prev_x, max_delta))
-            glided.append((out_t, prev_x + delta))
-
-        if capped:
-            # The cut. Hold the outgoing framing right up to it, then jump in one frame —
-            # otherwise the piecewise-linear expression would ramp between the two shots.
-            cut_t, new_x = glided[0]
-            hold_t = cut_t - SNAP_S
-            if hold_t > capped[-1][0]:
-                capped.append((hold_t, capped[-1][1]))
-            capped.append((cut_t, new_x))
-            capped.extend(glided[1:])
-        else:
-            capped.extend(glided)
-
-    # Thin to a keypoint budget so the ffmpeg expression stays a sane size. Never drop a
-    # cut: thinning one away would restore the very ramp this is here to prevent.
-    if len(capped) > MAX_CROP_KEYPOINTS:
-        cuts = {
-            i
-            for i in range(1, len(capped))
-            if capped[i][0] - capped[i - 1][0] <= SNAP_S + 1e-6
-            and abs(capped[i][1] - capped[i - 1][1]) > 1.0
-        }
-        keep = cuts | {i - 1 for i in cuts} | {0, len(capped) - 1}
-        budget = max(0, MAX_CROP_KEYPOINTS - len(keep))
-        rest = [i for i in range(len(capped)) if i not in keep]
-        if budget and rest:
-            stride = len(rest) / budget
-            keep |= {rest[int(i * stride)] for i in range(budget)}
-        capped = [capped[i] for i in sorted(keep)]
-
-    if capped[0][0] > 0:
-        capped.insert(0, (0.0, capped[0][1]))
-    if capped[-1][0] < timeline.duration:
-        capped.append((timeline.duration, capped[-1][1]))
-    return capped
-
-
-def _split_at_cuts(
-    mapped: list[tuple[float, float]], src_w: int
-) -> list[list[tuple[float, float]]]:
-    """Group face samples into shots. A big jump between samples is a cut, not a pan."""
-    threshold = CUT_JUMP_FRAC * src_w
-    shots: list[list[tuple[float, float]]] = [[mapped[0]]]
-    for prev, cur in zip(mapped, mapped[1:], strict=False):
-        if abs(cur[1] - prev[1]) > threshold:
-            shots.append([cur])
-        else:
-            shots[-1].append(cur)
-    return shots
-
-
-def crop_x_expr(keypoints: list[tuple[float, float]]) -> str:
-    """A piecewise-linear ffmpeg expression for the crop x, in output time.
-
-    Built as a *flat sum of half-open gates* rather than nested ifs: each gate
-    contributes on exactly one interval, so there is no double-counting at the
-    boundaries and no expression-parser recursion to blow up.
-    """
-    if not keypoints:
-        return "(in_w-out_w)/2"
-    if len(keypoints) == 1:
-        return f"{keypoints[0][1]:.1f}"
-
-    terms: list[str] = []
-    for i in range(len(keypoints) - 1):
-        t0, x0 = keypoints[i]
-        t1, x1 = keypoints[i + 1]
-        if t1 - t0 < 1e-3:
-            continue
-        slope = (x1 - x0) / (t1 - t0)
-        terms.append(f"(gte(t,{t0:.3f})*lt(t,{t1:.3f})*({x0:.1f}+{slope:.3f}*(t-{t0:.3f})))")
-
-    last_t, last_x = keypoints[-1]
-    terms.append(f"(gte(t,{last_t:.3f})*{last_x:.1f})")
-    return "clip(" + "+".join(terms) + ",0,in_w-out_w)"
-
-
-def two_speaker_columns(
-    samples: list[tuple[float, float]], src_w: int, crop_w: int
-) -> tuple[float, float] | None:
-    """Split face centres into two clusters (a two-shot). None if it isn't one."""
-    if len(samples) < 8:
-        return None
-    xs = sorted(rel_x for _, rel_x in samples)
-
-    # Largest gap in the sorted centres is the split between the two speakers.
-    best_gap, split = 0.0, -1
-    for i in range(1, len(xs)):
-        gap = xs[i] - xs[i - 1]
-        if gap > best_gap:
-            best_gap, split = gap, i
-    if best_gap < 0.15 or split < 0:
-        return None
-
-    left, right = xs[:split], xs[split:]
-    minority = min(len(left), len(right)) / len(xs)
-    if minority < 0.2:
-        return None
-
-    def column(group: list[float]) -> float:
-        centre = (sum(group) / len(group)) * src_w
-        return max(0.0, min(centre - crop_w / 2, float(src_w - crop_w)))
-
-    return column(left), column(right)
 
 
 # --------------------------------------------------------------------------
@@ -639,14 +380,21 @@ def build_filtergraph(
     keypoints: list[tuple[float, float]],
     columns: tuple[float, float] | None,
     ass_file: str,
+    fit_spans: list[tuple[float, float]] | None = None,
 ) -> str:
-    """Assemble the pass-2 graph: concat → crossfade → crop → scale → captions.
+    """Assemble the pass-2 graph: concat → crossfade → reframe → captions.
 
     Input *i* is segment *i*'s intermediate file, already normalized by
     ``extract_segments`` — so every link in this graph has the same size, frame rate,
     timebase, and sample format by construction.
+
+    ``fit_spans`` are the output-time windows where no face was on screen. There the
+    9:16 crop is not merely unflattering, it is *wrong* — it framed a red letter "D"
+    while the speaker stood outside the frame, and it sliced a chart slide down to its
+    middle third. Those windows get the whole frame over a blurred fill instead, switched
+    in with a single gated overlay rather than by cutting the timeline apart.
     """
-    crop_w = _crop_width(src_w, src_h)
+    crop_w = crop_width(src_w, src_h)
     parts: list[str] = []
 
     # 1. Pin the timebase on each input. `concat` emits 1/1000000 and `fps` emits 1/30,
@@ -690,6 +438,7 @@ def build_filtergraph(
             accumulated += member_durations[member] - CROSSFADE_S
 
     # 4. Reframe to 9:16.
+    spans = fit_spans or []
     if reframe == "stacked" and columns is not None:
         left_x, right_x = columns
         panel_h = OUT_H // 2
@@ -705,13 +454,20 @@ def build_filtergraph(
             f"[sb]crop=w={panel_w}:h={src_h}:x={right_x:.0f}:y=0,scale={OUT_W}:{panel_h}[bot]"
         )
         parts.append("[top][bot]vstack=inputs=2[vr]")
+    elif reframe == "fit" or (spans and _covers(spans, timeline.duration)):
+        # No face anywhere in the clip — a crop would be a blind guess at what matters.
+        parts.extend(fit_chain(video_label, "[vr]"))
+    elif spans:
+        # Both layouts, and a gated overlay to pick between them. `overlay` passes its
+        # *main* input through wherever `enable` is false, so follow is main and fit is
+        # the overlay: outside the faceless spans the fit branch costs nothing but its
+        # own decode, and the switch itself is exact to the frame.
+        parts.append(f"{video_label}split=2[rf_follow][rf_fit]")
+        parts.append(f"[rf_follow]{follow_chain(src_h, crop_w, keypoints, reframe)}[rf_fw]")
+        parts.extend(fit_chain("[rf_fit]", "[rf_ft]"))
+        parts.append(f"[rf_fw][rf_ft]overlay=0:0:enable='{enable_expr(spans)}'[vr]")
     else:
-        x_expr = crop_x_expr(keypoints) if reframe == "speaker" and keypoints else "(in_w-out_w)/2"
-        parts.append(
-            f"{video_label}crop=w={crop_w}:h={src_h}:x='{x_expr}':y=0,"
-            f"scale={OUT_W}:{OUT_H}:force_original_aspect_ratio=decrease,"
-            f"pad={OUT_W}:{OUT_H}:(ow-iw)/2:(oh-ih)/2:black[vr]"
-        )
+        parts.append(f"{video_label}{follow_chain(src_h, crop_w, keypoints, reframe)}[vr]")
 
     # 5. Burn in captions from the bundled font. cwd is the job temp dir, so these are
     #    bare relative paths and need no filtergraph escaping.
@@ -722,6 +478,18 @@ def build_filtergraph(
     parts.append(f"{audio_label}aresample={AUDIO_RATE},asetpts=PTS-STARTPTS[aout]")
 
     return ";".join(parts)
+
+
+def _covers(spans: list[tuple[float, float]], duration: float) -> bool:
+    """True when the fit spans account for essentially the whole clip.
+
+    Then there is no follow branch worth building: skip the split and the overlay and
+    emit the fit layout on its own.
+    """
+    if not spans or duration <= 0:
+        return False
+    covered = sum(min(end, duration) - max(start, 0.0) for start, end in spans)
+    return covered >= duration - 0.5
 
 
 # --------------------------------------------------------------------------

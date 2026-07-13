@@ -18,11 +18,11 @@ from _clip_helpers import connect, error_result, ok_result
 from _clip_publish import source_deep_link
 from _clip_queue import get_job as queue_get_job
 from _clip_queue import reconcile, wait_for
+from _clip_reframe import crop_x_expr
 from _clip_render import (
     Segment,
     Timeline,
     build_timeline,
-    crop_x_expr,
     detect_silences,
     keep_segments,
 )
@@ -282,6 +282,22 @@ def test_cold_open_pronoun_is_soft_flagged():
     assert not cold_open_warning("Funding is a trap for founders.", 10.0)
 
 
+def test_a_span_starting_in_the_title_card_is_soft_flagged():
+    """The transcript starts before the picture does.
+
+    TED's first spoken word lands at 0.4s — but the first 3.3s of *video* are a logo sting
+    and a full second of black. The first live batch shipped a clip that opened exactly
+    there: the entire hook was someone else's branding, with a caption over it.
+    """
+    warning = cold_open_warning("Teenagers today are amazing.", 0.4)
+    assert warning
+    assert "title card" in warning
+    assert "sample_frames" in warning  # the hint names the tool that can actually look
+
+    # Well past the intro, a clean opening line is not flagged at all.
+    assert not cold_open_warning("Teenagers today are amazing.", 600.0)
+
+
 # --------------------------------------------------------------------------
 # Silence trim
 # --------------------------------------------------------------------------
@@ -311,6 +327,41 @@ def test_keep_segments_never_returns_nothing():
     """An all-silent span degrades to the raw span rather than producing an empty clip."""
     kept = keep_segments(0.0, 10.0, [(0.0, 10.0)], drop_threshold_s=0.5, pad_s=0.15)
     assert kept == [(0.0, 10.0)]
+
+
+def test_a_cut_that_would_save_almost_nothing_is_not_made():
+    """Padding can shrink a drop to a rounding error, and the jump cut still costs full price.
+
+    A 0.62s silence with 250ms of pad on each side removes 0.12s of audio — and leaves a
+    hard visual discontinuity to save a tenth of a second. Not worth it.
+    """
+    kept = keep_segments(0.0, 30.0, [(10.0, 10.62)], drop_threshold_s=0.5, pad_s=0.25)
+    assert kept == [(0.0, 30.0)], "the pause should have been left alone"
+
+
+def test_the_trim_thresholds_do_not_cut_breath_pauses():
+    """The first live batch put TEN hard cuts in a 37s clip to remove 4.9s of "dead air".
+
+    Some of what it cut was 0.35s long — a breath between clauses. Every drop is a visual
+    jump cut, so a threshold that fires on a breath buys a fraction of a second and pays
+    for it with a discontinuity the viewer sees. Speech pauses run to ~0.7s.
+    """
+    from _clip_helpers import TRIM_THRESHOLDS
+
+    assert min(TRIM_THRESHOLDS.values()) >= 0.6, (
+        "a threshold under 0.6s cuts natural speech pauses, not dead air"
+    )
+
+    # Replay the joke clip's real silences through the tightest preset.
+    breaths = [(5.0, 5.43), (9.0, 9.46), (14.0, 14.35)]  # 0.43s, 0.46s, 0.35s — all breaths
+    dead_air = [(20.0, 22.43)]  # 2.4s — a real pause
+    kept = keep_segments(
+        0.0, 30.0, breaths + dead_air, drop_threshold_s=TRIM_THRESHOLDS["very_tight"], pad_s=0.12
+    )
+
+    assert len(kept) == 2, f"only the dead air should have been cut, got {len(kept) - 1} cuts"
+    assert kept[0][1] == pytest.approx(20.12)
+    assert kept[1][0] == pytest.approx(22.31)
 
 
 def test_detect_silences_finds_the_real_gaps(source_video):
@@ -409,9 +460,92 @@ def test_crop_expr_degrades_to_centre_without_keypoints():
     assert crop_x_expr([]) == "(in_w-out_w)/2"
 
 
+# --------------------------------------------------------------------------
+# The follow/fit layout switch
+# --------------------------------------------------------------------------
+
+
+def _track(hits, sampled):
+    from _clip_reframe import FaceTrack
+
+    return FaceTrack(hits=hits, sampled=sampled)
+
+
+def test_a_faceless_stretch_becomes_a_fit_span():
+    """Sampled-and-empty is the signal. Where nobody is on screen, do not crop into it."""
+    from _clip_reframe import fit_spans
+
+    timeline = Timeline(segments=[Segment(0.0, 20.0, 0.0, 0)], duration=20.0)
+    sampled = [i * 0.5 for i in range(40)]  # 0.0 .. 19.5, every 500ms
+    # A face for the first 5s and the last 5s; nothing in between (a wide shot, or a slide).
+    hits = [(t, 0.5) for t in sampled if t < 5.0 or t >= 15.0]
+
+    spans = fit_spans(_track(hits, sampled), timeline)
+
+    assert len(spans) == 1
+    start, end = spans[0]
+    assert 4.9 <= start <= 5.1
+    assert 14.9 <= end <= 15.1
+
+
+def test_a_single_missed_detection_does_not_flip_the_layout():
+    """A blink is not a shot change. Flipping the whole frame for 500ms would read as a glitch."""
+    from _clip_reframe import fit_spans
+
+    timeline = Timeline(segments=[Segment(0.0, 20.0, 0.0, 0)], duration=20.0)
+    sampled = [i * 0.5 for i in range(40)]
+    hits = [(t, 0.5) for t in sampled if t not in (7.0,)]  # exactly one empty frame
+
+    assert fit_spans(_track(hits, sampled), timeline) == []
+
+
+def test_the_fit_layout_keeps_the_whole_frame_and_never_crops():
+    """The whole point: nothing is cropped away, so a full-width chart survives intact."""
+    from _clip_reframe import fit_chain
+
+    chain = ";".join(fit_chain("[in]", "[out]"))
+
+    assert "crop=270:480" in chain  # the *blurred fill* is cropped — that is fine, it is a backdrop
+    assert "scale=1080:-2" in chain  # ...but the visible frame is only ever SCALED
+    assert "overlay=" in chain
+    # No 9:16 column crop anywhere in the visible path.
+    assert "crop=w=" not in chain
+
+
+def test_the_graph_switches_layouts_with_a_gate_not_by_cutting_the_timeline():
+    """Audio must never learn that the video layout moved — so no extra concat joins."""
+    from _clip_render import build_filtergraph
+
+    timeline = Timeline(segments=[Segment(0.0, 20.0, 0.0, 0)], duration=20.0)
+    graph = build_filtergraph(
+        timeline,
+        src_w=1920,
+        src_h=1080,
+        reframe="speaker",
+        keypoints=[(0.0, 400.0), (20.0, 400.0)],
+        columns=None,
+        ass_file="",
+        fit_spans=[(5.0, 15.0)],
+    )
+
+    assert "overlay=0:0:enable='between(t,5.000,15.000)'" in graph
+    assert "crop=w=606" in graph  # the follow branch still exists for the rest of the clip
+    assert "gblur" in graph  # ...and so does the fit branch
+    assert "concat=" not in graph  # one segment in, one segment out: nothing was re-cut
+
+
+def test_enable_expr_terms_never_overlap():
+    """Summed gates: two overlapping betweens would make enable==2, which is still true, but the
+    spans are merged upstream precisely so the expression stays a clean boolean."""
+    from _clip_reframe import enable_expr
+
+    assert enable_expr([]) == "0"
+    assert enable_expr([(1.0, 2.0), (5.0, 6.5)]) == "between(t,1.000,2.000)+between(t,5.000,6.500)"
+
+
 def test_smooth_centers_caps_pan_speed_within_a_shot():
     """A speaker pacing the stage must not make the crop lurch after them."""
-    from _clip_render import MAX_PAN_PX_PER_S, smooth_centers
+    from _clip_reframe import MAX_PAN_PX_PER_S, smooth_centers
 
     timeline = Timeline(
         segments=[Segment(src_start=0.0, src_end=10.0, out_start=0.0, member=0)], duration=10.0
@@ -437,7 +571,7 @@ def test_a_shot_cut_snaps_instead_of_crawling_after_the_new_framing():
     position. On a TED talk that left the speaker's face sliced by the frame edge for a
     full second after the cut. A person cannot cross the frame in 500 ms; a camera can.
     """
-    from _clip_render import SNAP_S, smooth_centers
+    from _clip_reframe import SNAP_S, smooth_centers
 
     timeline = Timeline(
         segments=[Segment(src_start=0.0, src_end=10.0, out_start=0.0, member=0)], duration=10.0
@@ -476,7 +610,7 @@ def test_a_shot_cut_snaps_instead_of_crawling_after_the_new_framing():
 
 def test_smooth_centers_maps_onto_output_time_not_source_time():
     """Keypoints feed a crop expression evaluated in output time — a source-time bug desyncs it."""
-    from _clip_render import smooth_centers
+    from _clip_reframe import smooth_centers
 
     timeline = Timeline(
         segments=[Segment(src_start=100.0, src_end=110.0, out_start=0.0, member=0)], duration=10.0
@@ -923,8 +1057,17 @@ def test_mixed_shape_members_actually_encode(registered_source):
 
 
 @pytest.mark.timeout(600)
-def test_speaker_reframe_degrades_to_centre_when_no_face_is_found(registered_source):
-    """No face (or no MediaPipe) must degrade to a centred crop and say so — never fail."""
+def test_no_face_shows_the_whole_frame_instead_of_cropping_blind(registered_source):
+    """No face on screen must fall back to the WHOLE FRAME, never to a centred crop.
+
+    This used to assert the opposite, and the first live batch showed what that costs. A
+    9:16 crop keeps a third of the width; where the detector finds nothing, that third is
+    a guess. On the TED talk the guess framed a giant red letter "D" and the backs of the
+    audience's heads while the speaker stood outside the frame — and on a chart slide it
+    kept the middle third of a full-width graph, cutting the title to "o / e / ren".
+
+    A frame with no face in it is precisely the frame you must not crop into.
+    """
     source_id = registered_source["source_id"]
     engine.add_candidates(
         source_id, [{"start": 0.5, "end": 8.0, "label": "quote", "score": 9, "reason": "x"}]
@@ -936,7 +1079,10 @@ def test_speaker_reframe_degrades_to_centre_when_no_face_is_found(registered_sou
     assert job["status"] == "done", f"speaker reframe failed outright: {job.get('error')}"
 
     # The synthetic source has no face in it, so the fallback must have engaged loudly.
-    assert any("centred crop" in s for s in job["progress"])
+    assert any("whole frame" in s for s in job["progress"]), job["progress"]
+    assert not any("centred crop" in s for s in job["progress"]), (
+        "a centred crop on a faceless frame is the bug, not the fallback"
+    )
 
     probed = _probe(Path(job["output_path"]))
     video = next(s for s in probed["streams"] if s["codec_type"] == "video")
