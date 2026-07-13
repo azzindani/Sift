@@ -66,10 +66,38 @@ For a public VPS with automatic HTTPS, set `SIFT_DOMAIN` in `.env` and run
 | `GET /version` | public | Running version — alert on a stale deploy without a token. |
 | `GET /tokens/whoami` | Bearer | Which named token you are. |
 | `GET /clips/{batch}/{file}` | Bearer | Published clips, thumbnails, manifests, galleries. |
+| `/oauth/*`, `/.well-known/oauth-*` | public | OAuth 2.0 + PKCE — the claude.ai connector handshake. |
 
 Auth is four modes in priority order — `SIFT_TOKENS_FILE` > `SIFT_TOKENS` > `SIFT_API_KEY` >
 open (localhost only, warns loudly). Same contract as Folio, so one client config style
 reaches both.
+
+A configured-but-unusable token source is a **hard stop**, not a downgrade to open. A
+missing, unreadable, malformed, or empty `tokens.json` aborts startup with a message
+naming the fix. (The first live deployment mounted it `600 root:root` while the container
+runs as uid 999 — the server came up serving every tool unauthenticated. It no longer can.)
+
+### One key, every platform
+
+`claude.ai` will not accept a raw bearer token; its Custom Connector requires an OAuth
+handshake. So Sift exposes one — and bridges it to the *same* token registry:
+
+```
+Claude Code / curl / n8n  ──  Authorization: Bearer sk-sift-…   ┐
+                                                                ├──►  principal "claude-code"
+claude.ai Custom Connector ──  OAuth → paste that same key      ┘
+```
+
+The token `/oauth/token` mints is opaque, but it maps back to whichever `tokens.json`
+entry you pasted at `/oauth/authorize`. Both paths are the same identity, and the audit
+log names it the same way. There is nothing to configure.
+
+**Adding it to claude.ai:** Settings → Connectors → *Add custom connector* → URL
+`https://your-host/mcp`. Leave client ID and secret blank (dynamic registration handles
+it). You'll get a Sift page asking for your API key — paste any value from `tokens.json`.
+
+Access tokens last 24h and refresh silently for 30 days; grants are persisted, so a
+container restart does not force you to reauthorize.
 
 ## The library
 

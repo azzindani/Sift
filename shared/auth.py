@@ -128,7 +128,18 @@ def authorize(header: str | None) -> str | None:
     presented = header[len("Bearer ") :].strip()
     if not presented:
         return None
-    return registry.tokens.get(presented)
+
+    name = registry.tokens.get(presented)
+    if name:
+        return name
+
+    # Second pass: a token minted by /oauth/token. It is opaque random bytes, but it
+    # maps back to whichever registry principal was pasted at /oauth/authorize — so a
+    # claude.ai connector session and a direct `Bearer sk-sift-…` are the same identity
+    # in the audit log. This is what lets ONE key work on every platform.
+    from shared.oauth import resolve_oauth_token  # noqa: PLC0415 - breaks an import cycle
+
+    return resolve_oauth_token(presented)
 
 
 def describe_auth() -> str:
