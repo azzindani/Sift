@@ -128,13 +128,16 @@ Three ways in, and they see the same files:
 
 | | |
 |---|---|
-| **`GET /library/`** | A browsable file server over the whole library — read-only, behind basic auth. Folio's `/files` pattern. Set `SIFT_BASIC_USER` / `SIFT_BASIC_HASH` and point your proxy at `SIFT_PROJECTS_DIR`; see [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md). |
+| **`GET /library/`** | Browse it in a browser — read-only, gated by the **same key**. Visit `/library/?token=sk-sift-…` once and you get a 30-day session cookie. No separate login. |
 | **`list_library()`** | The MCP tool — what the *agent* uses. Structured, bounded, no file dump. |
 | **The filesystem** | It is just YAML. `git init` it, diff it, hand-edit a candidate boundary and the next `plan_clips` reads your edit. |
 
-The browse gate is basic auth rather than the MCP bearer for one boring reason: a browser
-cannot present an `Authorization: Bearer` header. Clips fetched by a *client* stay
-bearer-gated at `/clips/…`.
+There is **no separate login**. A browser cannot send an `Authorization: Bearer` header, so
+the library takes the key once from `?token=` and hands back an HttpOnly cookie — which
+holds a *minted session token*, never the API key itself. `Authorization: Bearer` still works
+for scripts. (Basic auth would mean a second credential for your own library, and a browser
+password popup can never be satisfied by an access token anyway — Folio dropped it for the
+same reason.)
 
 ## How it works
 

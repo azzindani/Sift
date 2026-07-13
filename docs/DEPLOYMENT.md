@@ -15,6 +15,8 @@ client configured for one works against the other.
 | `GET /version` | public | Running version, so a monitor can alert on a stale deploy without a token. |
 | `GET /tokens/whoami` | **Bearer** | Which named token you presented. The cheapest auth sanity check. |
 | `GET /clips/{batch}/{file}` | **Bearer** | Published clips, thumbnails, manifests, galleries. |
+| `GET /library/*` | **Bearer / `?token=` / cookie** | Browse the library in a browser. Same key; no separate login. |
+| `/oauth/*`, `/.well-known/oauth-*` | public | OAuth 2.0 + PKCE — the claude.ai Custom Connector handshake. |
 
 `/health` and `/version` are public **on purpose**: a monitor that needs a secret to
 check liveness is a monitor that stops working the day you rotate the secret. Neither
@@ -115,42 +117,34 @@ Then point a client at it:
 
 ### 4a. The browsable library (`/library`)
 
-The library is the durable record, so make it *visible*. Serve `SIFT_PROJECTS_DIR` as a
-read-only file server behind basic auth — a browser cannot present a bearer token, which
-is why this gate is basic and not the MCP one. (Folio does the same at `/files`.)
+The library is the durable record, so make it *visible*. Sift serves it itself — there is
+nothing to mount, no static file server, and **no separate login**:
 
-```sh
-docker run --rm caddy:2-alpine caddy hash-password --plaintext 'your-password'
+```
+https://sift.mydomain.tld/library/?token=sk-sift-...
 ```
 
-```sh
-# .env — DOUBLE every $ in the hash. Compose interpolates env_file values, so a raw
-# bcrypt hash ($2a$14$…) is read as three undefined variables and collapses to an
-# EMPTY STRING — leaving the gate open. $$ escapes back to a literal $.
-SIFT_BASIC_USER=sift
-SIFT_BASIC_HASH=$$2a$$14$$...
-```
+That is the **same key** as the MCP endpoint. It is exchanged once for an HttpOnly
+`sift_session` cookie (30 days) and dropped from the URL, so it does not linger in history
+or a screenshot. The cookie holds a *minted session token*, never the API key itself.
+`Authorization: Bearer` works too, for scripts.
+
+Behind a reverse proxy, just forward it — Sift is the sole gate:
 
 ```caddyfile
-# Mount the library at /srv/library and root at /srv, so the URL path and the disk
-# path line up. Rooting at /srv/sift and adding `uri strip_prefix /library` instead
-# rewrites the path BEFORE file_server builds its listing — every breadcrumb then
-# comes out as /default/ rather than /library/default/, and 404s.
 @library path /library /library/*
 handle @library {
-    basic_auth {
-        {$SIFT_BASIC_USER} {$SIFT_BASIC_HASH}
+    reverse_proxy sift:8765 {
+        header_up Host {host}
+        header_up X-Forwarded-Proto {scheme}
     }
-    root * /srv
-    file_server browse
 }
 ```
 
-```yaml
-# docker-compose.yml — the proxy needs the files, read-only.
-volumes:
-  - ./sift-projects:/srv/library:ro
-```
+**Do not put basic auth in front of it.** A browser username/password popup can never be
+satisfied by an access token, and a second credential for reading your own library defeats
+the point of one key everywhere. (Folio's `/files` route started that way and dropped it
+for exactly this reason; its Caddyfile still says so.)
 
 Source **video** never appears there: it is downloaded, cut, and deleted. Transcripts,
 candidates, clips and manifests do.

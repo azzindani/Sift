@@ -10,6 +10,7 @@ The HTTP surface deliberately mirrors Folio's, so one client config style reache
     GET  /version         running version                                 [public]
     GET  /tokens/whoami   which named token you are                       [Bearer]
     GET  /clips/{b}/{f}   published clip, thumbnail, manifest, gallery    [Bearer]
+    GET  /library/*       browse the library  [Bearer | ?token= | session cookie]
     *    /oauth/*         OAuth 2.0 + PKCE for claude.ai's connector      [public]
     GET  /.well-known/oauth-*   RFC 8414 / RFC 9728 discovery             [public]
 
@@ -45,8 +46,8 @@ from starlette.responses import (
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 import engine
-from _clip_helpers import serve_dir
-from shared import oauth
+from _clip_helpers import projects_dir, serve_dir
+from shared import browse, oauth
 from shared.auth import (
     OPEN_PRINCIPAL,
     AuthConfigError,
@@ -255,9 +256,16 @@ class AuthMiddleware:
         # The OAuth handshake IS the pre-auth path: claude.ai walks discovery,
         # registration and PKCE anonymously, before it holds any token at all. Gating
         # these behind the bearer would make the connector impossible to add.
+        #
+        # /library is exempt for a different reason: it is reached by a BROWSER, which
+        # cannot send an Authorization header. It carries its own gate (?token= → session
+        # cookie), so the route is the sole authority — the same shape as Folio's
+        # static-server. Exempt from the middleware, never from authentication.
         if (
             path in PUBLIC_PATHS
             or path.startswith(OAUTH_PATH_PREFIXES)
+            or path == "/library"
+            or path.startswith("/library/")
             or scope.get("method") == "OPTIONS"
         ):
             await self.app(scope, receive, send)
@@ -434,6 +442,73 @@ async def oauth_token(request: Request) -> Response:
         return JSONResponse({"error": "invalid_request"}, status_code=413, headers=_CORS)
     status, payload = oauth.token(body)
     return JSONResponse(payload, status_code=status, headers=_CORS)
+
+
+# ── The library, browsable ───────────────────────────────────────────────────────
+# Same key as everything else. Folio dropped basic_auth from its equivalent route for
+# exactly the reason its comment gives — a browser username/password popup "could never
+# be satisfied by an access token anyway" — and handing someone a SECOND credential to
+# look at their own library defeats the point of one key everywhere.
+#
+# ?token=sk-sift-… once → HttpOnly session cookie → 30 days. Bearer works too, for scripts.
+# The cookie carries a minted session token, never the API key.
+
+
+def _library_principal(request: Request) -> str | None:
+    """Bearer, or the session cookie. (The ?token= hand-off is handled by the route.)"""
+    principal = authorize(request.headers.get("authorization"))
+    if principal:
+        return principal
+    cookie = request.cookies.get(oauth.SESSION_COOKIE, "")
+    return authorize(f"Bearer {cookie}") if cookie else None
+
+
+@mcp.custom_route("/library", methods=["GET"])
+@mcp.custom_route("/library/{path:path}", methods=["GET"])
+async def library(request: Request) -> Response:
+    """Browse the durable record: projects, transcripts, candidates, clips, manifests."""
+    rel = request.path_params.get("path", "")
+    url_path = "/library/" + rel
+
+    # Hand-off: a valid ?token= is swapped for a cookie and the token is dropped from the
+    # URL, so it does not linger in history, logs, or a shared screenshot.
+    presented = request.query_params.get("token", "")
+    if presented:
+        principal = authorize(f"Bearer {presented}")
+        if not principal:
+            return HTMLResponse(browse.gate_page(url_path), status_code=401)
+        response = RedirectResponse(url_path, status_code=302)
+        response.set_cookie(
+            oauth.SESSION_COOKIE,
+            oauth.mint_session(principal),
+            max_age=oauth.SESSION_TTL_S,
+            httponly=True,
+            secure=request.url.scheme == "https"
+            or request.headers.get("x-forwarded-proto") == "https",
+            samesite="lax",
+            path="/library",
+        )
+        return response
+
+    if _library_principal(request) is None:
+        # A plain 401 with no WWW-Authenticate: a browser popup cannot carry a bearer.
+        return HTMLResponse(browse.gate_page(url_path), status_code=401)
+
+    root = projects_dir()
+    target = browse.resolve(root, rel)
+    if target is None:
+        return HTMLResponse(browse.render(url_path, [], "Not found."), status_code=404)
+
+    if target.is_dir():
+        if rel and not request.url.path.endswith("/"):
+            return RedirectResponse(url_path + "/", status_code=302)
+        hint = "Empty. Nothing has been fetched into this project yet."
+        return HTMLResponse(browse.render(url_path, browse.listing(target, url_path), hint))
+
+    media = browse.INLINE_TYPES.get(target.suffix.lower())
+    if media is None:
+        return HTMLResponse(browse.render(url_path, [], "Not a readable file."), status_code=404)
+    return FileResponse(target, media_type=media)
 
 
 @mcp.custom_route("/clips/{batch_id}/{filename}", methods=["GET", "HEAD"])

@@ -57,6 +57,11 @@ CLIENT_MAX = 256
 # the container.
 MAX_BODY_BYTES = int(os.environ.get("SIFT_OAUTH_MAX_BODY_BYTES", 256 * 1024))
 
+# Browser session for the library. Long, because re-pasting a key into a URL every day is
+# the kind of friction that makes people turn auth off.
+SESSION_TTL_S = int(os.environ.get("SIFT_SESSION_TTL_S", 30 * 24 * 60 * 60))
+SESSION_COOKIE = "sift_session"
+
 OAUTH_PATH_PREFIXES = ("/oauth/", "/.well-known/oauth-")
 
 
@@ -198,6 +203,22 @@ def _lookup_principal(api_key: str) -> str | None:
     if registry.mode == "open":
         return OPEN_PRINCIPAL
     return registry.tokens.get(api_key)
+
+
+def mint_session(principal: str, ttl_s: int = SESSION_TTL_S) -> str:
+    """Mint a browser-session token for the library, bound to an existing principal.
+
+    A browser cannot send ``Authorization: Bearer``, so the library takes the key once
+    from ``?token=`` and hands back an HttpOnly cookie holding *this* — never the API key
+    itself. It rides the same persisted store as OAuth access tokens, so it survives a
+    restart and is revoked by the same expiry sweep.
+    """
+    token = _token()
+    with _lock:
+        _ensure_loaded()
+        _access[token] = _Grant(principal, time.time() + ttl_s)
+        _persist(_access, _state_dir() / "access-tokens.json")
+    return token
 
 
 def _issue_pair(principal: str, scope: str) -> dict[str, object]:
