@@ -98,8 +98,12 @@ services:
       # Mount tokens.json read-only when SIFT_TOKENS_FILE is set. Optional —
       # comment out if you use SIFT_TOKENS (inline) or SIFT_API_KEY instead.
       - ./tokens.json:/home/sift/tokens.json:ro
-      # Optional: a cookies.txt for yt-dlp, to get past bot challenges.
-      # - ./cookies.txt:/home/sift/cookies.txt:ro
+      # Secrets that are not the token file. A *directory* mount, deliberately: bind-mounting
+      # a file that does not exist yet makes Docker create a directory in its place, so a
+      # commented-out cookies.txt line is the only safe way to ship one. Mounting the folder
+      # instead means dropping ./secrets/cookies.txt in later just works — no edit, no
+      # restart, since yt-dlp reads the jar per call.
+      - ./secrets:/home/sift/secrets:ro
 
     networks:
       - sift_net

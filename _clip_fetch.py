@@ -158,10 +158,21 @@ def _ytdlp_args(cookies_path: str = "") -> list[str]:
     ]
     if force_ipv4():
         args.append("--force-ipv4")
-    cookies = cookies_path or cookies_path_default()
-    if cookies:
-        resolved = resolve_path(cookies, allowed_exts=(".txt",), must_exist=True)
+    # An explicit cookies_path= from the agent is a promise the file is there, so a bad one
+    # is an error. SIFT_COOKIES_PATH is standing config for a jar that may not have been
+    # dropped in yet — a missing one must not break every fetch of every site that needs no
+    # cookies at all. Log it; the bot-challenge hint already names the knob.
+    if cookies_path:
+        resolved = resolve_path(cookies_path, allowed_exts=(".txt",), must_exist=True)
         args += ["--cookies", str(resolved)]
+    elif configured := cookies_path_default():
+        jar = Path(configured)
+        if jar.is_file():
+            args += ["--cookies", str(resolve_path(configured, allowed_exts=(".txt",)))]
+        else:
+            log.warning(
+                "SIFT_COOKIES_PATH=%s does not exist — fetching without cookies", configured
+            )
     proxy = proxy_default()
     if proxy:
         args += ["--proxy", proxy]

@@ -27,3 +27,7 @@ sift-data/
 *.db-shm
 *.mcp_receipt.jsonl
 .mcp_versions/
+
+# Cookie jars and other per-host secrets. Live session tokens — never commit.
+secrets/*
+!secrets/README.md
