@@ -122,6 +122,20 @@ sift-projects/<project>/
 Delete `sift-data/sift.db` and it repopulates from the YAML on next boot. The database can
 never disagree with the library, because the library wins.
 
+### Browsing it
+
+Three ways in, and they see the same files:
+
+| | |
+|---|---|
+| **`GET /library/`** | A browsable file server over the whole library — read-only, behind basic auth. Folio's `/files` pattern. Set `SIFT_BASIC_USER` / `SIFT_BASIC_HASH` and point your proxy at `SIFT_PROJECTS_DIR`; see [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md). |
+| **`list_library()`** | The MCP tool — what the *agent* uses. Structured, bounded, no file dump. |
+| **The filesystem** | It is just YAML. `git init` it, diff it, hand-edit a candidate boundary and the next `plan_clips` reads your edit. |
+
+The browse gate is basic auth rather than the MCP bearer for one boring reason: a browser
+cannot present an `Authorization: Bearer` header. Clips fetched by a *client* stay
+bearer-gated at `/clips/…`.
+
 ## How it works
 
 1. `fetch_source(url, project="ep42")` pulls the source at ≤720p + transcript, with a disk

@@ -113,6 +113,48 @@ Then point a client at it:
 }
 ```
 
+### 4a. The browsable library (`/library`)
+
+The library is the durable record, so make it *visible*. Serve `SIFT_PROJECTS_DIR` as a
+read-only file server behind basic auth — a browser cannot present a bearer token, which
+is why this gate is basic and not the MCP one. (Folio does the same at `/files`.)
+
+```sh
+docker run --rm caddy:2-alpine caddy hash-password --plaintext 'your-password'
+```
+
+```sh
+# .env — DOUBLE every $ in the hash. Compose interpolates env_file values, so a raw
+# bcrypt hash ($2a$14$…) is read as three undefined variables and collapses to an
+# EMPTY STRING — leaving the gate open. $$ escapes back to a literal $.
+SIFT_BASIC_USER=sift
+SIFT_BASIC_HASH=$$2a$$14$$...
+```
+
+```caddyfile
+# Mount the library at /srv/library and root at /srv, so the URL path and the disk
+# path line up. Rooting at /srv/sift and adding `uri strip_prefix /library` instead
+# rewrites the path BEFORE file_server builds its listing — every breadcrumb then
+# comes out as /default/ rather than /library/default/, and 404s.
+@library path /library /library/*
+handle @library {
+    basic_auth {
+        {$SIFT_BASIC_USER} {$SIFT_BASIC_HASH}
+    }
+    root * /srv
+    file_server browse
+}
+```
+
+```yaml
+# docker-compose.yml — the proxy needs the files, read-only.
+volumes:
+  - ./sift-projects:/srv/library:ro
+```
+
+Source **video** never appears there: it is downloaded, cut, and deleted. Transcripts,
+candidates, clips and manifests do.
+
 ---
 
 ## 5. What to back up
