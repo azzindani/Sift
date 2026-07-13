@@ -276,18 +276,31 @@ def update_source(source_id: str, **fields: Any) -> dict[str, Any]:
 
 
 def find_source_by_url(url: str, project: str) -> dict[str, Any]:
-    """A prior source for this URL in this project whose video is still on disk."""
+    """A prior source for this URL in this project, video on disk or not.
+
+    It used to require the video to still be present, and that was a real bug: the video
+    is *deliberately* deleted at publish, so every re-fetch of a published URL minted a
+    NEW source_id — duplicating the transcript, orphaning the candidates, and leaving the
+    existing clips pointing at a source whose video could never come back. Which made
+    render_clip's own hint ("call fetch_source again") a lie.
+
+    Now the record is the identity. The video is just a cache: absent, the caller
+    re-downloads it into the same source_id and everything downstream still resolves.
+    """
     root = project_dir(project) / "sources"
     if not root.is_dir():
         return {}
     for path in sorted(root.glob("*/source.yaml")):
         record = read_yaml(path, {})
-        if record.get("url") != url:
-            continue
-        local = record.get("local_path") or ""
-        if local and Path(local).is_file():
+        if record.get("url") == url:
             return record
     return {}
+
+
+def source_video_present(record: dict[str, Any]) -> bool:
+    """Is this source's video actually on disk right now?"""
+    local = record.get("local_path") or ""
+    return bool(local) and Path(local).is_file()
 
 
 def load_transcript(source_id: str) -> dict[str, Any]:

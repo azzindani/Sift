@@ -409,22 +409,67 @@ def test_crop_expr_degrades_to_centre_without_keypoints():
     assert crop_x_expr([]) == "(in_w-out_w)/2"
 
 
-def test_smooth_centers_caps_pan_speed_so_the_crop_glides():
-    """A face teleporting across the frame must not fling the crop with it."""
+def test_smooth_centers_caps_pan_speed_within_a_shot():
+    """A speaker pacing the stage must not make the crop lurch after them."""
     from _clip_render import MAX_PAN_PX_PER_S, smooth_centers
 
     timeline = Timeline(
         segments=[Segment(src_start=0.0, src_end=10.0, out_start=0.0, member=0)], duration=10.0
     )
-    # A hard jump from the far left to the far right between two samples.
-    samples = [(0.0, 0.1), (0.5, 0.1), (1.0, 0.9), (1.5, 0.9), (2.0, 0.9)]
+    # Drifting across the frame, but by less per sample than a camera cut would.
+    samples = [(0.0, 0.40), (0.5, 0.50), (1.0, 0.60), (1.5, 0.66), (2.0, 0.70)]
     keypoints = smooth_centers(samples, src_w=1280, crop_w=404, timeline=timeline)
 
     for (t0, x0), (t1, x1) in zip(keypoints, keypoints[1:], strict=False):
         speed = abs(x1 - x0) / max(t1 - t0, 1e-3)
-        assert speed <= MAX_PAN_PX_PER_S + 1.0, f"crop snapped at {speed:.0f} px/s"
+        assert speed <= MAX_PAN_PX_PER_S + 1.0, f"crop lurched at {speed:.0f} px/s"
 
-    # Crop x always stays inside the frame.
+    for _, x in keypoints:
+        assert 0.0 <= x <= 1280 - 404
+
+
+def test_a_shot_cut_snaps_instead_of_crawling_after_the_new_framing():
+    """The bug this replaced: the crop panned ACROSS a cut at 90 px/s.
+
+    Real footage cuts between a wide shot and a close-up, and the subject's position jumps
+    hundreds of pixels in one frame. The old code smoothed straight through that — the
+    moving average blended the two shots, and the pan cap then crawled toward the new
+    position. On a TED talk that left the speaker's face sliced by the frame edge for a
+    full second after the cut. A person cannot cross the frame in 500 ms; a camera can.
+    """
+    from _clip_render import SNAP_S, smooth_centers
+
+    timeline = Timeline(
+        segments=[Segment(src_start=0.0, src_end=10.0, out_start=0.0, member=0)], duration=10.0
+    )
+    # Far left, then a hard cut to far right. This is a camera change, not a sprint.
+    samples = [(0.0, 0.1), (0.5, 0.1), (1.0, 0.9), (1.5, 0.9), (2.0, 0.9)]
+    keypoints = smooth_centers(samples, src_w=1280, crop_w=404, timeline=timeline)
+
+    def crop_at(t: float) -> float:
+        prev = keypoints[0]
+        for kp in keypoints:
+            if kp[0] >= t:
+                if kp[0] == prev[0]:
+                    return kp[1]
+                span = (t - prev[0]) / (kp[0] - prev[0])
+                return prev[1] + span * (kp[1] - prev[1])
+            prev = kp
+        return keypoints[-1][1]
+
+    # Where the face is after the cut, clamped to the frame: the crop cannot hang off the
+    # right edge, so the furthest right it can sit is src_w - crop_w.
+    target_after = min(0.9 * 1280 - 404 / 2, 1280 - 404)
+    before = crop_at(1.0 - SNAP_S - 0.01)
+    after = crop_at(1.0 + 0.01)
+
+    # It held the old framing right up to the cut, then jumped — not crawled.
+    assert before < 300, f"crop drifted before the cut: {before:.0f}"
+    assert abs(after - target_after) < 60, (
+        f"crop is at {after:.0f} one frame after the cut but the face is at "
+        f"{target_after:.0f} — it is crawling, and the speaker is out of frame"
+    )
+
     for _, x in keypoints:
         assert 0.0 <= x <= 1280 - 404
 

@@ -63,7 +63,20 @@ FACE_SAMPLE_FPS = 2.0
 MAX_FACE_SAMPLES = 240
 MAX_CROP_KEYPOINTS = 40
 SMOOTH_WINDOW = 5  # samples in the moving average
-MAX_PAN_PX_PER_S = 90.0  # crop glides, never snaps
+MAX_PAN_PX_PER_S = 90.0  # within a shot the crop glides, never snaps
+
+# ...but ACROSS a shot cut it must snap, and that is a different thing entirely.
+# A multi-camera source (every talk, every interview) cuts between a wide shot and a
+# close-up. The subject's position then jumps hundreds of pixels in one frame. Treating
+# that as camera *movement* means the moving average blends the two shots together and
+# the pan cap crawls toward the new position at 90 px/s — so for the ~1-3 seconds after
+# every cut the speaker is mis-framed or sliced by the frame edge. Verified on a TED
+# talk: at the wide->close-up cut, her face sat half outside the crop for a full second.
+#
+# A jump larger than this fraction of the frame width between two samples 125 ms apart is
+# not a person moving. It is the camera changing.
+CUT_JUMP_FRAC = 0.12
+SNAP_S = 0.04  # hold the old framing until one frame before the cut, then jump
 
 
 class RenderError(Exception):
@@ -408,32 +421,73 @@ def smooth_centers(
         return []
     mapped.sort(key=lambda p: p[0])
 
-    # Moving average.
-    smoothed: list[tuple[float, float]] = []
-    for i, (out_t, _) in enumerate(mapped):
-        lo = max(0, i - SMOOTH_WINDOW // 2)
-        hi = min(len(mapped), i + SMOOTH_WINDOW // 2 + 1)
-        window = [x for _, x in mapped[lo:hi]]
-        smoothed.append((out_t, sum(window) / len(window)))
+    # Smooth and cap WITHIN each shot; snap between them. Doing this across a cut is what
+    # slices the speaker in half for a second after every camera change.
+    capped: list[tuple[float, float]] = []
+    for shot in _split_at_cuts(mapped, src_w):
+        smoothed: list[tuple[float, float]] = []
+        for i, (out_t, _) in enumerate(shot):
+            lo = max(0, i - SMOOTH_WINDOW // 2)
+            hi = min(len(shot), i + SMOOTH_WINDOW // 2 + 1)
+            window = [x for _, x in shot[lo:hi]]
+            smoothed.append((out_t, sum(window) / len(window)))
 
-    # Pan-speed cap: the crop glides toward the target instead of snapping to it.
-    capped: list[tuple[float, float]] = [smoothed[0]]
-    for out_t, target in smoothed[1:]:
-        prev_t, prev_x = capped[-1]
-        max_delta = MAX_PAN_PX_PER_S * max(out_t - prev_t, 1e-3)
-        delta = max(-max_delta, min(target - prev_x, max_delta))
-        capped.append((out_t, prev_x + delta))
+        # Pan-speed cap: inside a shot the crop glides toward the target.
+        glided: list[tuple[float, float]] = [smoothed[0]]
+        for out_t, target in smoothed[1:]:
+            prev_t, prev_x = glided[-1]
+            max_delta = MAX_PAN_PX_PER_S * max(out_t - prev_t, 1e-3)
+            delta = max(-max_delta, min(target - prev_x, max_delta))
+            glided.append((out_t, prev_x + delta))
 
-    # Thin to a keypoint budget so the ffmpeg expression stays a sane size.
+        if capped:
+            # The cut. Hold the outgoing framing right up to it, then jump in one frame —
+            # otherwise the piecewise-linear expression would ramp between the two shots.
+            cut_t, new_x = glided[0]
+            hold_t = cut_t - SNAP_S
+            if hold_t > capped[-1][0]:
+                capped.append((hold_t, capped[-1][1]))
+            capped.append((cut_t, new_x))
+            capped.extend(glided[1:])
+        else:
+            capped.extend(glided)
+
+    # Thin to a keypoint budget so the ffmpeg expression stays a sane size. Never drop a
+    # cut: thinning one away would restore the very ramp this is here to prevent.
     if len(capped) > MAX_CROP_KEYPOINTS:
-        stride = len(capped) / MAX_CROP_KEYPOINTS
-        capped = [capped[int(i * stride)] for i in range(MAX_CROP_KEYPOINTS)]
+        cuts = {
+            i
+            for i in range(1, len(capped))
+            if capped[i][0] - capped[i - 1][0] <= SNAP_S + 1e-6
+            and abs(capped[i][1] - capped[i - 1][1]) > 1.0
+        }
+        keep = cuts | {i - 1 for i in cuts} | {0, len(capped) - 1}
+        budget = max(0, MAX_CROP_KEYPOINTS - len(keep))
+        rest = [i for i in range(len(capped)) if i not in keep]
+        if budget and rest:
+            stride = len(rest) / budget
+            keep |= {rest[int(i * stride)] for i in range(budget)}
+        capped = [capped[i] for i in sorted(keep)]
 
     if capped[0][0] > 0:
         capped.insert(0, (0.0, capped[0][1]))
     if capped[-1][0] < timeline.duration:
         capped.append((timeline.duration, capped[-1][1]))
     return capped
+
+
+def _split_at_cuts(
+    mapped: list[tuple[float, float]], src_w: int
+) -> list[list[tuple[float, float]]]:
+    """Group face samples into shots. A big jump between samples is a cut, not a pan."""
+    threshold = CUT_JUMP_FRAC * src_w
+    shots: list[list[tuple[float, float]]] = [[mapped[0]]]
+    for prev, cur in zip(mapped, mapped[1:], strict=False):
+        if abs(cur[1] - prev[1]) > threshold:
+            shots.append([cur])
+        else:
+            shots[-1].append(cur)
+    return shots
 
 
 def crop_x_expr(keypoints: list[tuple[float, float]]) -> str:
