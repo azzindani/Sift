@@ -378,6 +378,12 @@ def add_candidates(source_id: str, candidates: list[dict]) -> dict[str, Any]:
     )
 
     ok(progress, f"validated and stored {result['submitted']} candidate(s)")
+    if result.get("snapped"):
+        info(
+            progress,
+            f"snapped {result['snapped']} span(s) onto complete-sentence boundaries "
+            "so clips open and close on a whole thought",
+        )
     if result["merged"]:
         info(
             progress,
@@ -396,6 +402,7 @@ def add_candidates(source_id: str, candidates: list[dict]) -> dict[str, Any]:
         stored=result["stored"],
         submitted=result["submitted"],
         merged=result["merged"],
+        snapped=result.get("snapped", 0),
         warnings=result["warnings"],
         candidates=[
             {

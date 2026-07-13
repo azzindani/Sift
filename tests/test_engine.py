@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 import engine
-from _clip_helpers import connect, error_result, ok_result
+from _clip_helpers import MIN_CLIP_S, connect, error_result, ok_result
 from _clip_publish import source_deep_link
 from _clip_queue import get_job as queue_get_job
 from _clip_queue import reconcile, wait_for
@@ -26,7 +26,13 @@ from _clip_render import (
     detect_silences,
     keep_segments,
 )
-from _clip_select import cold_open_warning, merge_all, overlap_ratio
+from _clip_select import (
+    cold_open_warning,
+    dangling_end_warning,
+    merge_all,
+    overlap_ratio,
+    snap_span_to_sentences,
+)
 from _clip_transcript import (
     build_ass_word_pop,
     chunk_bounds,
@@ -296,6 +302,76 @@ def test_a_span_starting_in_the_title_card_is_soft_flagged():
 
     # Well past the intro, a clean opening line is not flagged at all.
     assert not cold_open_warning("Teenagers today are amazing.", 600.0)
+
+
+def test_a_clip_that_ends_mid_thought_is_soft_flagged():
+    """The mirror of cold-open: stopping on a conjunction ends before the payoff lands."""
+    assert dangling_end_warning("And here is the crazy part, which is that", 300.0)
+    assert dangling_end_warning("It out-tows an F-350 diesel because", 120.0)
+    assert not dangling_end_warning("It is alien technology.", 120.0)
+    assert not dangling_end_warning("Just make it out of steel.", 120.0)
+
+
+# --------------------------------------------------------------------------
+# Sentence-boundary snapping — the server cleans the cut, never picks the moment
+# --------------------------------------------------------------------------
+
+_SNAP_SEGS = [
+    {"start": 10.0, "end": 14.0, "text": "Scary stories sell, they always have."},
+    {"start": 14.5, "end": 19.0, "text": "And the more you hear it the more you believe it."},
+    {"start": 25.0, "end": 30.0, "text": "So a ban might feel good for the adults in the room."},
+]
+
+
+def test_a_mid_sentence_start_snaps_back_to_the_sentence():
+    """A start a beat into the opening sentence backs up to the sentence's start."""
+    start, end = snap_span_to_sentences(11.2, 19.0, _SNAP_SEGS)
+    assert start == 10.0  # snapped back onto "Scary stories..."
+    assert end == 19.0
+
+
+def test_a_mid_sentence_end_runs_on_to_the_sentence_end():
+    """An end a beat before the closing sentence finishes runs on to complete it."""
+    start, end = snap_span_to_sentences(10.0, 17.5, _SNAP_SEGS)
+    assert start == 10.0
+    assert end == 19.0  # completed "...the more you believe it"
+
+
+def test_a_start_in_dead_air_skips_forward_onto_the_sentence():
+    """A start sitting in the gap before a sentence skips forward onto speech."""
+    start, _ = snap_span_to_sentences(23.0, 30.0, _SNAP_SEGS)
+    assert start == 25.0  # skipped the 5s of dead air onto "So a ban..."
+
+
+def test_a_boundary_far_from_any_sentence_edge_is_left_alone():
+    """Past the tolerance the agent meant to cut there — a deliberate hard in/out."""
+    # start 11.2 is inside seg[0] but seg[0].start is 1.2s back (< tol) -> snaps.
+    # Make the start deep enough that the sentence start is beyond SNAP_TOL_S.
+    segs = [{"start": 0.0, "end": 40.0, "text": "one very long run-on segment of speech"}]
+    start, end = snap_span_to_sentences(20.0, 35.0, segs)
+    assert (start, end) == (20.0, 35.0)  # both edges are >4s from the segment edges
+
+
+def test_a_snap_never_shrinks_a_span_below_the_plan_floor():
+    """Tidying an edge must not cost the agent the candidate.
+
+    A 5.0s span whose end sits 0.2s past the last word would snap back to 4.8s — under
+    MIN_CLIP_S, so plan_clips would drop it and the moment would vanish with no error.
+    """
+    segs = [{"start": 10.0, "end": 14.8, "text": "A moment that only just clears the floor."}]
+    start, end = snap_span_to_sentences(10.0, 15.0, segs)
+
+    assert (start, end) == (10.0, 15.0)  # left alone rather than snapped into oblivion
+    assert end - start >= MIN_CLIP_S
+
+
+def test_a_span_already_under_the_plan_floor_can_still_snap():
+    """The floor is the one the span already cleared — snapping does not demote, but a
+    short candidate (destined to merge with a neighbour) can still have its edges tidied."""
+    segs = [{"start": 10.0, "end": 14.0, "text": "A short beat."}]
+    start, end = snap_span_to_sentences(10.5, 14.0, segs)
+
+    assert (start, end) == (10.0, 14.0)  # snapped, though only 4.0s — never was a clip alone
 
 
 # --------------------------------------------------------------------------

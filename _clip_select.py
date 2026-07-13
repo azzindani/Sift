@@ -67,6 +67,21 @@ COLD_OPEN_PRONOUNS = set(
 # before the picture does — TED's first word is at 0.4s, its logo sting runs to 3.3s.
 INTRO_GUARD_S = 8.0
 
+# How far a candidate boundary may be nudged to land on a complete sentence. The agent
+# picks a moment by ear and its start/end fall wherever; snapping to the nearest transcript
+# segment edge is what stops a clip opening mid-clause or ending before the point lands.
+# Beyond this the agent clearly meant to cut there, so the boundary is left alone.
+SNAP_TOL_S = 4.0
+
+# Words that cannot end a complete thought. A clip whose last word is one of these stops
+# before the payoff — "...and the crazy part is" with no crazy part. Symmetric with the
+# cold-open pronoun guard, which catches the same failure at the *start*.
+DANGLING_END_WORDS = set(
+    """and but or so because which who that if when while as of to in on at for with from
+    into onto than then is are was were be been being the a an my your his her our their its
+    this these those he she we they it i you""".split()  # noqa: SIM905
+)
+
 STOPWORDS = set(
     """the a an and or but if then than that this these those is are was were be been
     being to of in on at for with as by from it its i you he she we they them his her
@@ -251,6 +266,80 @@ def cold_open_warning(text: str, start: float) -> str:
     return ""
 
 
+def dangling_end_warning(text: str, end: float) -> str:
+    """Soft-flag a candidate that stops mid-thought.
+
+    The mirror of the cold-open guard: a clip whose last spoken word is a conjunction,
+    preposition, or article ("...and here's the crazy") ends before the point it was set
+    up to make. The viewer is left hanging. Cheap to detect, and it is one of the two most
+    common reasons a picked span reads as "bad context".
+    """
+    last = re.sub(r"[^a-z']", "", (text or "").strip().split(" ")[-1].lower()) if text else ""
+    if last and last in DANGLING_END_WORDS:
+        return (
+            f"Candidate ending near {end:.1f}s stops on '{last}' — mid-thought, before the "
+            "payoff. Extend end to the end of the sentence (read_transcript_chunk shows where "
+            "it lands)."
+        )
+    return ""
+
+
+def snap_span_to_sentences(
+    start: float, end: float, segments: list[dict[str, Any]]
+) -> tuple[float, float]:
+    """Nudge a span's edges onto complete-sentence boundaries, within ``SNAP_TOL_S``.
+
+    The agent picks a moment by ear, so its ``start``/``end`` land wherever the number
+    happened to fall — often a beat into the opening sentence, or a beat before the closing
+    one finishes. Snapping to the nearest transcript segment edge (segments are the
+    sentence-ish groupings from ``group_words_into_segments``) is what makes a clip begin
+    on a whole thought and end on one. It is pure geometry over the timestamps — no
+    judgement about *which* moment, only a cleaner cut of the one already chosen — so it
+    lives in the server, not the agent (CLAUDE.md §6: the agent scores, the server stores).
+
+    Conservative on purpose: a boundary only moves if a sentence edge is within
+    ``SNAP_TOL_S``. Past that the agent meant to cut there (a deliberate hard in/out), and
+    the span is left exactly as given.
+    """
+    if not segments:
+        return start, end
+
+    new_start = start
+    inside_start = next((s for s in segments if s["start"] <= start < s["end"]), None)
+    if inside_start is not None:
+        # Mid-sentence: back up to the sentence's start if it is close.
+        if 0 < start - inside_start["start"] <= SNAP_TOL_S:
+            new_start = inside_start["start"]
+    else:
+        # In a gap (dead air) before a sentence: skip forward onto the sentence.
+        nxt = min(
+            (s for s in segments if s["start"] >= start), key=lambda s: s["start"], default=None
+        )
+        if nxt is not None and nxt["start"] - start <= SNAP_TOL_S:
+            new_start = nxt["start"]
+
+    new_end = end
+    inside_end = next((s for s in segments if s["start"] < end <= s["end"]), None)
+    if inside_end is not None:
+        # Mid-sentence: run on to the sentence's end if it is close.
+        if 0 < inside_end["end"] - end <= SNAP_TOL_S:
+            new_end = inside_end["end"]
+    else:
+        # In a gap after a sentence: pull back onto the sentence.
+        prev = max((s for s in segments if s["end"] <= end), key=lambda s: s["end"], default=None)
+        if prev is not None and end - prev["end"] <= SNAP_TOL_S:
+            new_end = prev["end"]
+
+    # A snap tidies edges; it must never cost the agent the candidate. Trimming a beat of
+    # trailing dead air off a 5.0s span leaves 4.8s — under MIN_CLIP_S, so ``plan_clips``
+    # drops it and the moment vanishes with no error anywhere. So the floor a span has to
+    # clear after snapping is the floor it already cleared before it.
+    floor = MIN_CLIP_S if end - start >= MIN_CLIP_S else MIN_CANDIDATE_S
+    if new_end - new_start < floor:
+        return start, end
+    return round(new_start, 3), round(new_end, 3)
+
+
 # --------------------------------------------------------------------------
 # Persistence
 # --------------------------------------------------------------------------
@@ -288,6 +377,15 @@ def add_candidates(
     # Validate the entire array before a single row is written.
     validated = [validate_candidate(raw, i, duration) for i, raw in enumerate(incoming)]
 
+    # Snap each span onto complete-sentence edges before anything else sees it, so overlap
+    # detection, the stored record, and the render all work from the cleaned boundary.
+    snapped = 0
+    for cand in validated:
+        s, e = snap_span_to_sentences(cand["start"], cand["end"], segments)
+        if (s, e) != (cand["start"], cand["end"]):
+            snapped += 1
+        cand["start"], cand["end"] = s, e
+
     existing = load_candidates(source_id)
     before = len(existing)
     combined, fusions = merge_all(existing + validated)
@@ -295,9 +393,12 @@ def add_candidates(
     warnings: list[str] = []
     for cand in combined:
         cand["text"] = span_text(segments, cand["start"], cand["end"])[:2000]
-        warning = cold_open_warning(cand["text"], cand["start"])
-        if warning:
-            warnings.append(warning)
+        for warning in (
+            cold_open_warning(cand["text"], cand["start"]),
+            dangling_end_warning(cand["text"], cand["end"]),
+        ):
+            if warning:
+                warnings.append(warning)
 
     for cand in combined:
         cand.setdefault("candidate_id", new_id("cand"))
@@ -311,6 +412,7 @@ def add_candidates(
         "stored": len(combined),
         "submitted": len(validated),
         "merged": fusions,
+        "snapped": snapped,
         "previously_stored": before,
         "warnings": warnings,
         "candidates": combined,
