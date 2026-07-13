@@ -34,7 +34,14 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 import engine
 from _clip_helpers import serve_dir
-from shared.auth import OPEN_PRINCIPAL, authorize, describe_auth, rate_limiter_from_env
+from shared.auth import (
+    OPEN_PRINCIPAL,
+    AuthConfigError,
+    authorize,
+    describe_auth,
+    load_tokens,
+    rate_limiter_from_env,
+)
 from shared.file_utils import PathError, resolve_path
 from shared.platform_utils import check_toolchain
 
@@ -340,6 +347,14 @@ def main() -> None:
     parser.add_argument("--host", default=os.environ.get("SIFT_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("SIFT_PORT", "8765")))
     args = parser.parse_args()
+
+    # Resolve auth BEFORE anything binds a socket. A configured-but-unusable token
+    # source is a hard stop, never a silent downgrade to open — see shared/auth.py.
+    try:
+        load_tokens(force=True)
+    except AuthConfigError as exc:
+        log.error("auth misconfigured: %s", exc)
+        raise SystemExit(2) from None
 
     state = engine.startup()
     log.info(

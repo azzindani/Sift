@@ -122,9 +122,13 @@ services:
     restart: unless-stopped
     depends_on:
       - sift
+    # Compose interpolates EVERY service at parse time, including ones behind an
+    # inactive profile — so a `:?required` here would abort `docker compose up`
+    # for anyone who fronts Sift with their own router and never enables `tls`.
+    # These stay soft; the Caddyfile is what actually needs them.
     environment:
-      SIFT_DOMAIN: ${SIFT_DOMAIN:?set SIFT_DOMAIN in .env (e.g. sift.example.com)}
-      SIFT_ACME_EMAIL: ${SIFT_ACME_EMAIL:?set SIFT_ACME_EMAIL in .env for Let's Encrypt}
+      SIFT_DOMAIN: ${SIFT_DOMAIN:-}
+      SIFT_ACME_EMAIL: ${SIFT_ACME_EMAIL:-}
     ports:
       - "80:80"
       - "443:443"
