@@ -44,6 +44,7 @@ from _clip_library import (
     new_source_id,
     project_dir,
     save_source,
+    source_video_present,
     update_source,
     validate_project,
 )
@@ -434,7 +435,11 @@ def prepare_source(
 
     existing = find_existing(url, project)
     if existing:
+        # Same URL, same source_id — the transcript, the candidates and every clip built
+        # from them stay valid. The video is only a cache; if publish deleted it, pull it
+        # again into the SAME record rather than minting a duplicate source.
         existing["reused"] = True
+        existing["video_present"] = source_video_present(existing)
         return existing
 
     info, langs = probe_with_captions(url, cookies_path)

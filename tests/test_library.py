@@ -450,3 +450,34 @@ def test_a_render_blocked_by_a_failed_download_says_why(registered_source):
     assert "never downloaded" in job["error"]
     assert "empty stream" in job["error"]  # the *actual* upstream reason, surfaced
     assert "fetch_source" in job["hint"]
+
+
+def test_refetching_a_published_url_reuses_the_source_instead_of_duplicating_it(registered_source):
+    """The recovery path render_clip *tells you to take* must actually work.
+
+    publish_outputs deletes the source video on purpose (a 3h source is ~2.7 GB). The
+    dedup used to require the video to still be on disk, so re-fetching a published URL
+    minted a NEW source_id: the transcript was duplicated, the candidates were orphaned,
+    and the clips pointed at a source whose video could never come back. render_clip's own
+    hint said "call fetch_source(url) again" — and doing that fixed nothing.
+    """
+    from _clip_fetch import prepare_source
+    from _clip_library import find_source_by_url, load_source, update_source
+
+    sid = registered_source["source_id"]
+    url = registered_source["url"]
+    project = registered_source["project"]
+
+    # Exactly what publish does: drop the video, keep the record.
+    record = load_source(sid)
+    Path(record["local_path"]).unlink()
+    update_source(sid, local_path="")
+
+    assert find_source_by_url(url, project).get("source_id") == sid, (
+        "a published source became invisible to dedup — the next fetch would duplicate it"
+    )
+
+    again = prepare_source(url, max_height=720, cookies_path="", project=project)
+    assert again["source_id"] == sid, "re-fetch minted a NEW source and orphaned the clips"
+    assert again["reused"] is True
+    assert again["video_present"] is False, "the caller must know it has to re-download"

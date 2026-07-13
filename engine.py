@@ -162,9 +162,15 @@ def fetch_source(
     chunks = chunk_count(duration)
 
     reused = bool(source.get("reused"))
-    if reused:
+    if reused and source.get("video_present"):
         ok(progress, "source already in this project — reusing it (no re-download)")
         job_id = pending_fetch(source_id)
+    elif reused:
+        # The video was deleted at publish. Same source_id, same transcript, same
+        # candidates, same clips — just pull the bytes back so a re-render can run.
+        ok(progress, f"source {source_id} already here; its video was deleted at publish")
+        job_id = pending_fetch(source_id) or enqueue_fetch(source_id, project, cookies_path)
+        info(progress, f"re-downloading the video as {job_id} — renders will queue behind it")
     else:
         ok(progress, "probed, disk-guarded, and pulled the transcript")
         job_id = enqueue_fetch(source_id, project, cookies_path)
