@@ -53,8 +53,13 @@ services:
       SIFT_PROJECTS_DIR: /home/sift/projects
       SIFT_DATA_DIR: /home/sift/.sift
 
-      # VPS resource profile: 480p source cap, 5-min read windows, 24-frame vision budget.
+      # VPS resource profile: 720p source cap, 5-min read windows, 24-frame vision budget.
       MCP_CONSTRAINED_MODE: ${MCP_CONSTRAINED_MODE:-1}
+
+      # Source download cap, overriding the tier default (1080 normal / 720 constrained).
+      # The output is 1080x1920 and a 9:16 crop of a 16:9 source is only 0.5625*height
+      # wide, so a 720p source is upscaled 2.67x to fill the frame and a 480p source 4x.
+      SIFT_MAX_HEIGHT: ${SIFT_MAX_HEIGHT:-}
 
       # Auth — pick ONE. The file wins if several are set.
       SIFT_TOKENS_FILE: ${SIFT_TOKENS_FILE:-}

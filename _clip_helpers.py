@@ -140,8 +140,18 @@ def get_max_segments() -> int:
 
 
 def get_max_height() -> int:
-    """Source download resolution cap."""
-    return 480 if constrained() else 720
+    """Source download resolution cap. ``SIFT_MAX_HEIGHT`` overrides the tier default.
+
+    The output is 1080x1920, and a 9:16 crop of a 16:9 source is only ``0.5625 * height``
+    wide — so a 720p source is cropped to 405px and blown up 2.67x to fill the frame, and
+    a 480p source 4x. That is where the first live batch's softness came from: every clip
+    was an upscale of a quarter of a 720p frame. From 1080p the same crop is 607px and the
+    upscale is 1.78x, which is what the crop path is actually designed for.
+    """
+    override = os.environ.get("SIFT_MAX_HEIGHT", "").strip()
+    if override.isdigit() and int(override) > 0:
+        return int(override)
+    return 720 if constrained() else 1080
 
 
 def get_frame_budget() -> int:
@@ -222,15 +232,21 @@ LABEL_REGISTRY: dict[str, dict[str, Any]] = {
 }
 
 LABELS = tuple(LABEL_REGISTRY)
-REFRAME_MODES = ("speaker", "center", "stacked")
+REFRAME_MODES = ("speaker", "center", "stacked", "fit")
 PLAN_MODES = ("auto", "by_label", "by_topic", "montage", "supercut")
 
 # How much silence to drop, per label's trim aggressiveness (seconds).
+#
+# These were all roughly half this, and the first live batch showed why that was wrong: a
+# 37s clip came back with *ten* hard cuts in it, to remove 4.9s. Some of the "dead air" it
+# cut was 0.35s long — a breath between clauses, not a pause. Every drop is a visual jump
+# cut, so a threshold below ~0.6s buys a fraction of a second and pays for it with a
+# discontinuity the viewer sees. Speech pauses run 0.3-0.7s; real dead air runs past 1s.
 TRIM_THRESHOLDS = {
-    "very_tight": 0.35,
-    "tight": 0.50,
-    "medium": 0.70,
-    "gentle": 1.20,
+    "very_tight": 0.60,
+    "tight": 0.80,
+    "medium": 1.10,
+    "gentle": 1.80,
 }
 
 

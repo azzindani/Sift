@@ -30,23 +30,26 @@ from _clip_helpers import (
     receipt_path,
     row_to_dict,
 )
+from _clip_reframe import (
+    crop_width,
+    detect_faces,
+    fit_spans,
+    smooth_centers,
+    two_speaker_columns,
+)
 from _clip_render import (
     RenderError,
-    _crop_width,
     build_ass,
     build_filtergraph,
     build_timeline,
     clamp_dimensions,
-    detect_faces,
     encode,
     estimate_crf,
     extract_segments,
     make_thumbnail,
     probe_duration,
-    smooth_centers,
     summarize_segments,
     trimmed_seconds,
-    two_speaker_columns,
 )
 from _clip_select import get_clip
 from shared.file_utils import safe_mkdir, sweep_dir
@@ -267,29 +270,43 @@ def _render(job: dict[str, Any]) -> None:
     mark(f"kept {timeline.duration:.1f}s, dropped {dropped:.1f}s of dead air")
 
     src_w, src_h = clamp_dimensions(int(source.get("width") or 0), int(source.get("height") or 0))
-    crop_w = _crop_width(src_w, src_h)
+    crop_w = crop_width(src_w, src_h)
 
     keypoints: list[tuple[float, float]] = []
     columns: tuple[float, float] | None = None
+    spans: list[tuple[float, float]] = []
     effective_reframe = reframe
 
     if reframe in {"speaker", "stacked"}:
         mark(f"detecting faces for {reframe} reframe")
-        samples = detect_faces(video, timeline, temp)
-        if not samples:
-            effective_reframe = "center"
-            mark("no face data (MediaPipe absent or no face found) — using a centred crop")
+        track = detect_faces(video, timeline, temp)
+        # Where the detector looked and found nobody, the source is on a wide shot or a
+        # slide. Cropping there frames the backdrop and cuts a full-width chart in half,
+        # so those spans show the whole frame instead.
+        spans = fit_spans(track, timeline)
+        if not track:
+            effective_reframe = "fit"
+            mark("no face anywhere — showing the whole frame over a blurred fill")
         elif reframe == "stacked":
-            columns = two_speaker_columns(samples, src_w, crop_w)
+            columns = two_speaker_columns(track.hits, src_w, crop_w)
             if columns is None:
                 effective_reframe = "speaker"
-                keypoints = smooth_centers(samples, src_w, crop_w, timeline)
+                keypoints = smooth_centers(track.hits, src_w, crop_w, timeline)
                 mark("only one speaker on screen — falling back to speaker-follow")
             else:
                 mark("two speakers detected — stacked two-shot layout")
+                spans = []  # the stacked layout has no follow branch to switch away from
         else:
-            keypoints = smooth_centers(samples, src_w, crop_w, timeline)
-            mark(f"smoothed {len(keypoints)} crop keypoints from {len(samples)} face samples")
+            keypoints = smooth_centers(track.hits, src_w, crop_w, timeline)
+            mark(f"smoothed {len(keypoints)} crop keypoints from {len(track.hits)} face samples")
+        if spans:
+            covered = sum(end - start for start, end in spans)
+            mark(
+                f"{len(spans)} span(s), {covered:.1f}s, have no face on screen — "
+                f"showing the whole frame there instead of cropping into it"
+            )
+    elif reframe == "fit":
+        mark("fit reframe — whole frame over a blurred fill")
 
     ass_file = ""
     if captions:
@@ -310,7 +327,7 @@ def _render(job: dict[str, Any]) -> None:
     mark(f"encoding {timeline.duration:.1f}s at {OUT_LABEL}")
     output = temp / "clip.mp4"
     filtergraph = build_filtergraph(
-        timeline, src_w, src_h, effective_reframe, keypoints, columns, ass_file
+        timeline, src_w, src_h, effective_reframe, keypoints, columns, ass_file, spans
     )
     (temp / "filtergraph.txt").write_text(filtergraph, encoding="utf-8")
     encode(intermediates, temp, filtergraph, output, crf=estimate_crf(timeline.duration))

@@ -63,6 +63,10 @@ COLD_OPEN_PRONOUNS = set(
     we us our and but so because which who""".split()  # noqa: SIM905 - a word list reads better than 24 quoted strings
 )
 
+# How much of a source's opening is presumed to be a title card. The transcript starts
+# before the picture does — TED's first word is at 0.4s, its logo sting runs to 3.3s.
+INTRO_GUARD_S = 8.0
+
 STOPWORDS = set(
     """the a an and or but if then than that this these those is are was were be been
     being to of in on at for with as by from it its i you he she we they them his her
@@ -218,12 +222,31 @@ def merge_all(candidates: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], i
 
 
 def cold_open_warning(text: str, start: float) -> str:
-    """Soft-flag a candidate whose first word refers to something the viewer never saw."""
+    """Soft-flag a candidate that opens on something the viewer cannot follow.
+
+    Two ways that happens, and the first live batch produced both.
+
+    *Textually*, the first word refers to something the viewer never saw ("but…", "it…").
+
+    *Visually*, the span starts inside the source's opening seconds. A produced video
+    opens on a title card, and the transcript does not say so — the TED talk's first word
+    lands at 0.4s, but the first 3.3s of **video** are a logo sting and a second of pure
+    black. A clip that starts there spends its entire hook on someone else's branding.
+    The server cannot know where the card ends without decoding, so it says so and leaves
+    the call to the agent, which can look with ``sample_frames``.
+    """
     first = re.sub(r"[^a-z']", "", (text or "").strip().split(" ")[0].lower()) if text else ""
     if first and first in COLD_OPEN_PRONOUNS:
         return (
             f"Candidate at {start:.1f}s opens on '{first}' — a bare reference with no antecedent. "
             "Extend start to include what it refers to (the 2-min chunk overlap shows it)."
+        )
+    if start < INTRO_GUARD_S:
+        return (
+            f"Candidate starts at {start:.1f}s, inside the source's opening {INTRO_GUARD_S:.0f}s. "
+            "Produced videos open on a title card or logo sting, and the transcript does not "
+            "show it — the clip would spend its hook on branding, or on black. Call "
+            "sample_frames() across the first seconds and start after the card."
         )
     return ""
 
