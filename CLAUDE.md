@@ -255,7 +255,32 @@ no `eval`/`exec`, `shell=False`, `resolve_path` first, ≤10 tools, no business 
       bot-challenges this IP, which exercised the cookies/proxy error path for real.
 - [ ] End-to-end on the real 2c/4GB VPS with a full 2h source (this box is 4c/16GB).
 
-### What the live run taught us (four bugs no synthetic fixture would have found)
+### What the live runs taught us (bugs no synthetic fixture would have found)
+
+**From the containerized HTTP deployment:**
+
+5. **FastMCP runs a *sync* tool body on the event loop** (`FunctionTool.run` →
+   `type_adapter.validate_python`, no thread offload). Every tool here does blocking I/O and
+   `fetch_source` can sit in a yt-dlp probe for fifteen seconds. On the loop that stalls health
+   checks, in-flight SSE streams, and every other client — on a shared endpoint it is an outage,
+   not a slow call. Every tool body is now `async def` + `anyio.to_thread`.
+6. **`fetch_source` was synchronous and took minutes.** An MCP client times out around 30s, so
+   it simply never returned over HTTP (STANDARDS §23). Split: probe + disk guard + *transcript*
+   inline (seconds); the **video download is queued** on the same worker that encodes. The agent
+   now reads and selects *while the video downloads* — the two overlap instead of stacking.
+7. **Starlette's `BaseHTTPMiddleware` buffers streaming responses**, which deadlocks MCP's
+   Streamable HTTP SSE replies on any long call. The auth middleware is pure ASGI.
+8. **Docker's embedded DNS dropped the A record** for `www.ted.com` and returned AAAA only,
+   while the bridge network has no IPv6 route — so yt-dlp could not connect at all, on a URL
+   that worked from the host. Compose sets real resolvers; `/health` now reports the resolved
+   address families and 503s without an IPv4 route.
+9. **TED intermittently serves a 0-byte HLS variant** ("The downloaded file is empty") and an
+   **empty caption list**. Both are transient and both were being believed: the first left an
+   empty file that a `glob` could hand to the encoder, the second told the agent "this source
+   has no captions" — a dead end, not a retry. Both are now retried, and the video is chosen by
+   size, not glob order.
+
+**From the first live fetch (four bugs):**
 
 1. **Real VTT omits the blank-line cue separator.** TED does it before 35 of 415 cues. A
    block-splitting parser swallows those cues and leaks raw `-->` timestamps into the caption
