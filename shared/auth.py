@@ -13,6 +13,13 @@ configured for one works against the other.
 
 Named tokens exist so the audit log can say *who* called a tool, not just *that* someone
 did. A revoked name is one line out of a JSON file.
+
+**Fail closed.** Mode 4 is reachable only when *nothing* is configured. If a source IS
+configured and cannot be used — file missing, unreadable, malformed, empty — this raises
+``AuthConfigError`` and the server refuses to boot. It must never degrade to open: the
+first real deployment mounted ``tokens.json`` as ``600 root:root`` while the container
+runs as uid 999, and the old code logged a warning and served the whole tool surface
+unauthenticated. A misconfigured lock has to be a locked door, not an open one.
 """
 
 from __future__ import annotations
@@ -28,6 +35,10 @@ from pathlib import Path
 log = logging.getLogger("sift.auth")
 
 OPEN_PRINCIPAL = "__open__"
+
+
+class AuthConfigError(RuntimeError):
+    """An auth source was configured but is unusable. Startup aborts; never fall back."""
 
 
 @dataclass(frozen=True)
@@ -55,15 +66,29 @@ def load_tokens(force: bool = False) -> TokenRegistry:
         if path:
             try:
                 parsed = json.loads(Path(path).read_text(encoding="utf-8"))
-                for name, value in parsed.items():
-                    if isinstance(value, str) and value:
-                        tokens[value] = str(name)
-                if tokens:
-                    _registry = TokenRegistry("multi", tokens)
-                    return _registry
-                log.warning("SIFT_TOKENS_FILE loaded but has no usable entries (%s)", path)
-            except (OSError, json.JSONDecodeError, AttributeError) as exc:
-                log.warning("failed to read SIFT_TOKENS_FILE %s: %s", path, exc)
+            except OSError as exc:
+                raise AuthConfigError(
+                    f"SIFT_TOKENS_FILE={path} could not be read: {exc}. "
+                    f"In Docker the container runs as uid 999 — the file must be "
+                    f"readable by it (chown 999:999 tokens.json). Refusing to start "
+                    f"unauthenticated."
+                ) from exc
+            except (json.JSONDecodeError, AttributeError) as exc:
+                raise AuthConfigError(
+                    f"SIFT_TOKENS_FILE={path} is not valid JSON: {exc}. Expected "
+                    f'{{"name": "sk-..."}}. Refusing to start unauthenticated.'
+                ) from exc
+
+            for name, value in parsed.items():
+                if isinstance(value, str) and value:
+                    tokens[value] = str(name)
+            if not tokens:
+                raise AuthConfigError(
+                    f"SIFT_TOKENS_FILE={path} has no usable entries. Expected "
+                    f'{{"name": "sk-..."}}. Refusing to start unauthenticated.'
+                )
+            _registry = TokenRegistry("multi", tokens)
+            return _registry
 
         inline = os.environ.get("SIFT_TOKENS", "").strip()
         if inline:
@@ -71,10 +96,13 @@ def load_tokens(force: bool = False) -> TokenRegistry:
                 name, _, value = pair.partition(":")
                 if name.strip() and value.strip():
                     tokens[value.strip()] = name.strip()
-            if tokens:
-                _registry = TokenRegistry("multi", tokens)
-                return _registry
-            log.warning('SIFT_TOKENS set but unusable (expected "name:value,name:value")')
+            if not tokens:
+                raise AuthConfigError(
+                    'SIFT_TOKENS is set but unusable (expected "name:value,name:value"). '
+                    "Refusing to start unauthenticated."
+                )
+            _registry = TokenRegistry("multi", tokens)
+            return _registry
 
         single = os.environ.get("SIFT_API_KEY", "").strip()
         if single:

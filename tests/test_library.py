@@ -8,6 +8,7 @@ up. These tests hold that claim to account rather than taking it on faith.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -26,6 +27,7 @@ from _clip_library import (
 )
 from shared.auth import (
     OPEN_PRINCIPAL,
+    AuthConfigError,
     RateLimiter,
     authorize,
     describe_auth,
@@ -208,7 +210,47 @@ def test_tokens_file_wins_over_the_other_modes(monkeypatch, tmp_path):
     assert authorize("Bearer sk-single") is None
 
 
-def test_a_broken_tokens_file_falls_through_rather_than_locking_you_out(monkeypatch, tmp_path):
+# A configured-but-unusable token source must ABORT, never quietly serve open. The
+# first real deployment mounted tokens.json as 600 root:root while the container runs
+# as uid 999; the old code logged a warning, fell through, and brought the whole tool
+# surface up unauthenticated on a public domain. These four are that bug, nailed down.
+
+
+def test_an_unreadable_tokens_file_refuses_to_start(monkeypatch, tmp_path):
+    """The exact live failure: a 600 root:root mount, read by uid 999.
+
+    The PermissionError is injected rather than produced with chmod(0o000): the suite
+    often runs as root, and root reads a 0o000 file happily, so a chmod-based test
+    passes for the wrong reason on the very machine it matters on.
+    """
+    path = tmp_path / "tokens.json"
+    path.write_text(json.dumps({"claude": "sk-real"}), encoding="utf-8")
+
+    real_read = Path.read_text
+
+    def denied(self, *a, **kw):
+        if self == path:
+            raise PermissionError(13, "Permission denied")
+        return real_read(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "read_text", denied)
+    monkeypatch.setenv("SIFT_TOKENS_FILE", str(path))
+    monkeypatch.setenv("SIFT_API_KEY", "sk-fallback")  # must NOT rescue it
+    reset_for_tests()
+
+    with pytest.raises(AuthConfigError, match="could not be read"):
+        load_tokens(force=True)
+
+
+def test_a_missing_tokens_file_refuses_to_start(monkeypatch, tmp_path):
+    monkeypatch.setenv("SIFT_TOKENS_FILE", str(tmp_path / "nope.json"))
+    reset_for_tests()
+
+    with pytest.raises(AuthConfigError, match="could not be read"):
+        load_tokens(force=True)
+
+
+def test_a_malformed_tokens_file_refuses_to_start(monkeypatch, tmp_path):
     path = tmp_path / "tokens.json"
     path.write_text("{ not json", encoding="utf-8")
 
@@ -216,7 +258,25 @@ def test_a_broken_tokens_file_falls_through_rather_than_locking_you_out(monkeypa
     monkeypatch.setenv("SIFT_API_KEY", "sk-fallback")
     reset_for_tests()
 
-    assert authorize("Bearer sk-fallback") == "default"
+    with pytest.raises(AuthConfigError, match="not valid JSON"):
+        load_tokens(force=True)
+
+
+def test_an_empty_tokens_file_refuses_to_start(monkeypatch, tmp_path):
+    path = tmp_path / "tokens.json"
+    path.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setenv("SIFT_TOKENS_FILE", str(path))
+    reset_for_tests()
+
+    with pytest.raises(AuthConfigError, match="no usable entries"):
+        load_tokens(force=True)
+
+
+def test_open_mode_still_requires_that_nothing_at_all_is_configured(monkeypatch):
+    """The one path to open mode. Anything configured-but-broken raises instead."""
+    reset_for_tests()
+    assert load_tokens(force=True).mode == "open"
 
 
 # --------------------------------------------------------------------------
