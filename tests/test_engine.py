@@ -1263,9 +1263,9 @@ def test_two_captions_are_never_on_screen_at_once():
     here two words are 20ms apart and one pair is fully out of order."""
     words = [
         {"w": "I", "s": 0.00, "e": 0.30},
-        {"w": "think", "s": 0.02, "e": 0.40},   # starts 20ms after "I" — under any min duration
+        {"w": "think", "s": 0.02, "e": 0.40},  # starts 20ms after "I" — under any min duration
         {"w": "a", "s": 0.40, "e": 0.42},
-        {"w": "big", "s": 0.41, "e": 0.90},     # starts before "a" ends
+        {"w": "big", "s": 0.41, "e": 0.90},  # starts before "a" ends
         {"w": "work", "s": 0.90, "e": 1.30},
         {"w": "bubble.", "s": 1.30, "e": 1.80},
     ]
@@ -1282,3 +1282,58 @@ def test_captions_of_adjacent_lines_do_not_overlap_either():
     events = _ass_events(build_ass_word_pop(words))
     for (_, a_end), (b_start, _) in zip(events, events[1:], strict=False):
         assert a_end <= b_start + 1e-6
+
+
+def test_an_oom_killed_encode_retries_on_a_single_filter_thread(tmp_path, monkeypatch):
+    """Exit -9 is SIGKILL, and nothing in the pipeline sends it — it is the OOM killer. The
+    same clip renders fine minutes earlier, so losing it from a batch of 25 is not on."""
+    import _clip_render
+
+    calls: list[list[str]] = []
+
+    class Result:
+        timed_out = False
+
+        def __init__(self, rc):
+            self.returncode = rc
+            self.ok = rc == 0
+            self.stderr = ""
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        if len(calls) == 1:
+            return Result(-9)  # first, fast graph: killed
+        (tmp_path / "out.mp4").write_bytes(b"x")  # second, frugal graph: survives
+        return Result(0)
+
+    monkeypatch.setattr(_clip_render, "run", fake_run)
+    _clip_render.encode(
+        [tmp_path / "a.mp4"], tmp_path, "[0:v]null[vout];[0:a]anull[aout]", tmp_path / "out.mp4"
+    )
+
+    assert len(calls) == 2, "an OOM-killed encode must be retried"
+    assert "-filter_complex_threads" not in calls[0]
+    assert calls[1][calls[1].index("-filter_complex_threads") + 1] == "1"
+
+
+def test_an_encode_oom_killed_twice_gives_up_instead_of_looping(tmp_path, monkeypatch):
+    import _clip_render
+
+    calls = []
+
+    class Killed:
+        timed_out = False
+        returncode = -9
+        ok = False
+        stderr = "Killed"
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        return Killed()
+
+    monkeypatch.setattr(_clip_render, "run", fake_run)
+    with pytest.raises(_clip_render.RenderError) as caught:
+        _clip_render.encode([tmp_path / "a.mp4"], tmp_path, "g", tmp_path / "out.mp4")
+
+    assert len(calls) == 2  # tried fast, tried frugal, stopped
+    assert "SIFT_MEM_LIMIT" in caught.value.hint
