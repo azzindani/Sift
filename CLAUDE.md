@@ -297,7 +297,41 @@ no `eval`/`exec`, `shell=False`, `resolve_path` first, ≤10 tools, no business 
    podcast on two vCPUs. Segments are now cut with input seeking (`-ss` before `-i`) into
    normalized intermediates, then assembled — cost scales with the clip, not the source.
 
+**From the first *whole-source* run (a 3.3h podcast, 25 clips — four more bugs).** All four
+needed a real transcript of real speech; a fixture never produces the input that triggers them.
+
+1. **The captions were drawn twice, stacked.** libass renders *every* event covering the current
+   frame. Each word's highlight ended where the next began — but with a 50ms minimum duration,
+   and whisper emits consecutive words 20–40ms apart constantly. So a word's event outlived its
+   successor's start and both were live: two copies of the line, one above the other. Word timings
+   also cross outright, and a line's last word can run past the next line's first. None of the
+   ordering can be trusted; it is now forced.
+2. **A candidate quoted words the clip does not contain.** Whisper segments overlap their
+   neighbours by milliseconds, and snapping puts every edge exactly on a sentence boundary — so
+   `span_text` grazed the *next* segment and absorbed a fragment from outside the span. That text
+   is what the manifest shows to prove the clip matches the source. A segment must now be
+   genuinely inside the span (0.2s) to be quoted from it.
+3. **Transcript-only selection is blind to what is on screen.** JRE cuts to a screen-share
+   whenever Jamie pulls something up, so a span can be word-perfect and open on eight seconds of
+   a browser tab. The renderer already detects every faceless run — the fit layout depends on it
+   — it just never said *where*. A faceless run mid-clip is a cutaway and fit handles it; one at
+   the *top* is the only one that changes what the agent should do. The worker now names it and
+   reports, **in source time**, where the faces come back (`Timeline.source_time`, since output
+   time is not source time once dead air is trimmed).
+4. **A 2 GiB container cannot encode 1080x1920.** One clip in 25 died with `exit -9` — SIGKILL,
+   which nothing in the pipeline sends: the kernel's OOM killer, `constraint=CONSTRAINT_MEMCG`.
+   Measured, not guessed: a 45s clip on the split follow/fit graph peaks at **~1.3 GB and
+   plateaus** — big buffers, not a leak. Against a 2 GiB cap shared with the worker that sits
+   close enough to the ceiling to kill one clip while an identical one rendered fine a minute
+   earlier, which is why it presented as flaky. `SIFT_MEM_LIMIT` now defaults to **3g**. A
+   single-filter-thread retry was tried first and the measurement refuted it — the box killed
+   that too — so it was removed rather than shipped as a fallback that does not work.
+
 ### Known gaps / next up
+- [ ] **Nothing prompts the agent to look before it cuts.** `sample_frames` exists for exactly
+      this and the whole-source run never called it — the faceless-opening warning arrives only
+      *after* a render. A pre-plan visual check on candidate openings would catch it a stage
+      earlier, for the price of a few frames.
 - [ ] `by_topic` clustering is keyword-overlap only (Jaccard over content words). Good enough for
       "every money mention"; it will not cluster paraphrases. An agent grouping pass would.
 - [ ] No auth on the HTTP transport. Served paths are unguessable, but anyone who has a link has
