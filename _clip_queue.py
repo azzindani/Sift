@@ -66,6 +66,12 @@ _shutdown = threading.Event()
 POLL_INTERVAL_S = 1.0
 OUT_LABEL = "1080x1920"
 
+# A faceless run counts as "the clip opens blind" only if it starts within OPENING_S of the
+# top and lasts at least FACELESS_OPENING_S. A one-second cutaway on the first frame is not
+# worth a warning; three seconds of someone's browser tab is.
+OPENING_S = 0.5
+FACELESS_OPENING_S = 2.5
+
 
 class QueueError(Exception):
     """An enqueue was rejected. Carries an actionable hint."""
@@ -305,6 +311,19 @@ def _render(job: dict[str, Any]) -> None:
                 f"{len(spans)} span(s), {covered:.1f}s, have no face on screen — "
                 f"showing the whole frame there instead of cropping into it"
             )
+            # A faceless span in the middle of a clip is fine — it is a cutaway, and the fit
+            # layout handles it. A faceless span at the *start* is different: the clip opens
+            # on b-roll or a screen-share, so the first thing a viewer sees is not the
+            # conversation they are hearing. Only the agent can decide to move the cut, and
+            # it can only do that if it is told, in source time, where the faces come back.
+            lead_start, lead_end = spans[0]
+            if lead_start <= OPENING_S and lead_end - lead_start >= FACELESS_OPENING_S:
+                mark(
+                    f"clip opens with {lead_end - lead_start:.1f}s of no face on screen "
+                    f"(b-roll or a screen-share). Faces return at source "
+                    f"{timeline.source_time(lead_end):.1f}s — move `start` there to open on "
+                    f"the speakers, or keep it if the cutaway is the point."
+                )
     elif reframe == "fit":
         mark("fit reframe — whole frame over a blurred fill")
 

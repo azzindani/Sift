@@ -96,6 +96,10 @@ class Segment:
         """Map a source timestamp inside this segment onto the output timeline."""
         return self.out_start + (src_t - self.src_start)
 
+    def to_src(self, out_t: float) -> float:
+        """Map an output timestamp inside this segment back onto the source."""
+        return self.src_start + (out_t - self.out_start)
+
 
 @dataclass
 class Timeline:
@@ -122,6 +126,13 @@ class Timeline:
             if seg.src_start <= src_t < seg.src_end:
                 return seg.to_out(src_t)
         return None
+
+    def source_time(self, out_t: float) -> float:
+        """Map an output timestamp back onto the source, for reporting a cut point."""
+        for seg in self.segments:
+            if seg.out_start <= out_t < seg.out_start + seg.duration:
+                return seg.to_src(out_t)
+        return self.segments[-1].src_end if self.segments else 0.0
 
 
 # --------------------------------------------------------------------------

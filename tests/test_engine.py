@@ -1226,3 +1226,19 @@ def test_a_finished_sentence_ending_on_a_pronoun_is_not_flagged():
     assert dangling_end_warning("That's what communism gets you.", 100.0) == ""
     # But the same word with no terminal punctuation really is a clip stopping mid-thought.
     assert dangling_end_warning("Because that's what communism gets you and", 100.0)
+
+
+def test_source_time_maps_an_output_moment_back_onto_the_source():
+    """A faceless opening is only actionable if the agent is told, in source time, where the
+    faces come back — and dead-air trimming means output time is not source time."""
+    timeline = Timeline(
+        segments=[
+            Segment(src_start=100.0, src_end=110.0, out_start=0.0, member=0),
+            Segment(src_start=115.0, src_end=125.0, out_start=10.0, member=0),  # 5s dropped
+        ],
+        duration=20.0,
+    )
+    assert timeline.source_time(0.0) == pytest.approx(100.0)
+    assert timeline.source_time(8.0) == pytest.approx(108.0)
+    # Past the dropped air, output 12s is source 117s — not 112s.
+    assert timeline.source_time(12.0) == pytest.approx(117.0)
