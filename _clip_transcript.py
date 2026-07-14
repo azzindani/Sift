@@ -34,6 +34,10 @@ FONT_FILE = "LiberationSans-Bold.ttf"
 
 COLOR_BASE = "&H00FFFFFF"  # white          (ASS colours are &HAABBGGRR)
 COLOR_POP = "&H0000D7FF"  # gold highlight
+
+# The shortest a single word may hold the highlight. Also the minimum gap forced between
+# consecutive pops, which is what keeps their events from overlapping.
+MIN_POP_S = 0.06
 COLOR_OUTLINE = "&H00101010"
 COLOR_SHADOW = "&HA0000000"
 
@@ -427,18 +431,36 @@ def build_ass_word_pop(
     through the trim/concat timeline before calling this).
     """
     parts = [_header(font_size, margin_v)]
+    lines = build_caption_lines(words, caption_style)
 
-    for line in build_caption_lines(words, caption_style):
+    for index, line in enumerate(lines):
         line_start = line[0]["s"]
         line_end = max(line[-1]["e"], line_start + 0.3)
+        # A line must be gone before the next one appears. libass draws *every* event whose
+        # range covers the frame, so two that overlap put two copies of the caption on screen,
+        # stacked. Whisper's word timings touch and cross each other constantly, so nothing
+        # here can be trusted to be ordered — it has to be forced.
+        if index + 1 < len(lines):
+            line_end = min(line_end, lines[index + 1][0]["s"])
+        if line_end <= line_start:
+            continue
         tokens = [_ass_escape(w["w"]) for w in line]
 
+        # Each word's pop begins where the previous one's ends, so the starts must be strictly
+        # increasing. Two words 20ms apart (fast speech, or a repeat) would otherwise each get
+        # the 50ms minimum and overlap by 30ms — which is exactly the doubled caption.
+        starts: list[float] = []
         for i, word in enumerate(line):
-            start = line_start if i == 0 else max(word["s"], line_start)
-            end = line[i + 1]["s"] if i + 1 < len(line) else line_end
-            end = max(end, start + 0.05)
-            if end > line_end:
-                end = line_end
+            at = line_start if i == 0 else max(word["s"], line_start)
+            if starts and at < starts[-1] + MIN_POP_S:
+                at = starts[-1] + MIN_POP_S
+            starts.append(min(at, line_end))
+
+        for i, _word in enumerate(line):
+            start = starts[i]
+            end = starts[i + 1] if i + 1 < len(line) else line_end
+            if end - start < MIN_POP_S / 2:
+                continue  # squeezed out by its neighbours — it would flash for one frame
 
             rendered = []
             for j, token in enumerate(tokens):

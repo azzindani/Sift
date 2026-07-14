@@ -1242,3 +1242,43 @@ def test_source_time_maps_an_output_moment_back_onto_the_source():
     assert timeline.source_time(8.0) == pytest.approx(108.0)
     # Past the dropped air, output 12s is source 117s — not 112s.
     assert timeline.source_time(12.0) == pytest.approx(117.0)
+
+
+def _ass_events(ass: str) -> list[tuple[float, float]]:
+    def secs(stamp: str) -> float:
+        h, m, rest = stamp.split(":")
+        return int(h) * 3600 + int(m) * 60 + float(rest)
+
+    out = []
+    for row in ass.splitlines():
+        if row.startswith("Dialogue:"):
+            fields = row.split(",", 4)
+            out.append((secs(fields[1]), secs(fields[2])))
+    return out
+
+
+def test_two_captions_are_never_on_screen_at_once():
+    """libass draws every event covering the frame, so overlapping events stack two copies of
+    the caption on top of each other. Whisper's word timings touch and cross constantly —
+    here two words are 20ms apart and one pair is fully out of order."""
+    words = [
+        {"w": "I", "s": 0.00, "e": 0.30},
+        {"w": "think", "s": 0.02, "e": 0.40},   # starts 20ms after "I" — under any min duration
+        {"w": "a", "s": 0.40, "e": 0.42},
+        {"w": "big", "s": 0.41, "e": 0.90},     # starts before "a" ends
+        {"w": "work", "s": 0.90, "e": 1.30},
+        {"w": "bubble.", "s": 1.30, "e": 1.80},
+    ]
+    events = _ass_events(build_ass_word_pop(words))
+    assert events
+
+    for (a_start, a_end), (b_start, b_end) in zip(events, events[1:], strict=False):
+        assert a_end <= b_start + 1e-6, f"caption {a_start}-{a_end} overlaps {b_start}-{b_end}"
+
+
+def test_captions_of_adjacent_lines_do_not_overlap_either():
+    """The same doubling, one level up: a line whose last word runs past the next line's first."""
+    words = [{"w": f"w{i}", "s": i * 0.35, "e": i * 0.35 + 0.5} for i in range(14)]
+    events = _ass_events(build_ass_word_pop(words))
+    for (_, a_end), (b_start, _) in zip(events, events[1:], strict=False):
+        assert a_end <= b_start + 1e-6
