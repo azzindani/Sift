@@ -40,6 +40,7 @@ from _clip_transcript import (
     parse_json3,
     parse_vtt,
     slice_segments,
+    span_text,
 )
 from shared.file_utils import PathError, resolve_path
 from shared.platform_utils import ffprobe_bin, run
@@ -1195,3 +1196,33 @@ def test_multi_member_clip_crossfades_and_captions(registered_source):
     body = ass.read_text(encoding="utf-8")
     assert "Liberation Sans" in body  # the bundled font, never a system lookup
     assert body.count("Dialogue:") > 5
+
+
+def test_a_quote_never_includes_words_the_clip_does_not_contain():
+    """Whisper segments overlap their neighbours by a few milliseconds, so an edge that lands
+    on a sentence boundary — where snapping puts every edge — grazes the next segment. Quoting
+    it would print a trailing fragment the viewer never hears, in the summary that is supposed
+    to be checkable against the clip."""
+    segs = [
+        {"start": 10.0, "end": 20.0, "text": "The whole thought, delivered."},
+        {"start": 19.96, "end": 28.0, "text": "A different thought, not in this clip."},
+    ]
+    assert span_text(segs, 10.0, 20.0) == "The whole thought, delivered."
+
+
+def test_a_segment_genuinely_straddling_the_edge_is_still_quoted():
+    segs = [
+        {"start": 10.0, "end": 20.0, "text": "The setup."},
+        {"start": 19.0, "end": 28.0, "text": "Straddles by a full second — really is in the clip."},
+    ]
+    assert "Straddles" in span_text(segs, 10.0, 20.0)
+
+
+def test_a_finished_sentence_ending_on_a_pronoun_is_not_flagged():
+    """ "...we must do more of it." and "...that's what communism gets you." are finished
+    thoughts. Flagging them trains the agent to ignore the warning, which costs more than
+    the warning is worth."""
+    assert dangling_end_warning("It's true, and we must do more of it.", 100.0) == ""
+    assert dangling_end_warning("That's what communism gets you.", 100.0) == ""
+    # But the same word with no terminal punctuation really is a clip stopping mid-thought.
+    assert dangling_end_warning("Because that's what communism gets you and", 100.0)

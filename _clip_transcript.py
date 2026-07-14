@@ -334,9 +334,22 @@ def words_in_span(words: list[dict[str, Any]], start: float, end: float) -> list
     return out
 
 
+# A segment has to be genuinely inside the span to be quoted from it. Whisper hands back
+# segments that overlap their neighbours by a few milliseconds, so an edge that lands exactly
+# on a sentence boundary — which is where snapping puts every edge — clips the *next* segment
+# by a hair. Quoting it would print a trailing fragment the viewer never hears, in the very
+# summary that is supposed to be checkable against the clip.
+MIN_QUOTE_OVERLAP_S = 0.2
+
+
 def span_text(segments: list[dict[str, Any]], start: float, end: float) -> str:
-    """Flat text of a span — used to give a stored candidate its quotable text."""
-    return " ".join(seg["text"] for seg in slice_segments(segments, start, end)).strip()
+    """Flat text of a span — the quotable text of a candidate, and only what is in it."""
+    inside = [
+        seg
+        for seg in slice_segments(segments, start, end)
+        if min(seg["end"], end) - max(seg["start"], start) >= MIN_QUOTE_OVERLAP_S
+    ]
+    return " ".join(seg["text"] for seg in inside).strip()
 
 
 # --------------------------------------------------------------------------

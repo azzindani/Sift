@@ -273,8 +273,16 @@ def dangling_end_warning(text: str, end: float) -> str:
     preposition, or article ("...and here's the crazy") ends before the point it was set
     up to make. The viewer is left hanging. Cheap to detect, and it is one of the two most
     common reasons a picked span reads as "bad context".
+
+    Terminal punctuation settles it. Plenty of finished sentences end on a word from the list
+    — "we must do more of it.", "that's what communism gets you." — and flagging those trains
+    the agent to ignore the warning, which costs more than the warning is worth.
     """
-    last = re.sub(r"[^a-z']", "", (text or "").strip().split(" ")[-1].lower()) if text else ""
+    stripped = (text or "").strip()
+    if not stripped or stripped[-1] in ".!?":
+        return ""
+
+    last = re.sub(r"[^a-z']", "", stripped.split(" ")[-1].lower())
     if last and last in DANGLING_END_WORDS:
         return (
             f"Candidate ending near {end:.1f}s stops on '{last}' — mid-thought, before the "
