@@ -1284,56 +1284,22 @@ def test_captions_of_adjacent_lines_do_not_overlap_either():
         assert a_end <= b_start + 1e-6
 
 
-def test_an_oom_killed_encode_retries_on_a_single_filter_thread(tmp_path, monkeypatch):
-    """Exit -9 is SIGKILL, and nothing in the pipeline sends it — it is the OOM killer. The
-    same clip renders fine minutes earlier, so losing it from a batch of 25 is not on."""
+def test_an_oom_killed_encode_says_so_instead_of_blaming_the_filtergraph():
+    """Exit -9 is SIGKILL and nothing in the pipeline sends it — the kernel's OOM killer did.
+    ffmpeg's last line is a normal progress counter, so the failure reads like the encode
+    merely stopped, and the next person spends the afternoon reading filtergraphs."""
     import _clip_render
-
-    calls: list[list[str]] = []
-
-    class Result:
-        timed_out = False
-
-        def __init__(self, rc):
-            self.returncode = rc
-            self.ok = rc == 0
-            self.stderr = ""
-
-    def fake_run(args, **kwargs):
-        calls.append(args)
-        if len(calls) == 1:
-            return Result(-9)  # first, fast graph: killed
-        (tmp_path / "out.mp4").write_bytes(b"x")  # second, frugal graph: survives
-        return Result(0)
-
-    monkeypatch.setattr(_clip_render, "run", fake_run)
-    _clip_render.encode(
-        [tmp_path / "a.mp4"], tmp_path, "[0:v]null[vout];[0:a]anull[aout]", tmp_path / "out.mp4"
-    )
-
-    assert len(calls) == 2, "an OOM-killed encode must be retried"
-    assert "-filter_complex_threads" not in calls[0]
-    assert calls[1][calls[1].index("-filter_complex_threads") + 1] == "1"
-
-
-def test_an_encode_oom_killed_twice_gives_up_instead_of_looping(tmp_path, monkeypatch):
-    import _clip_render
-
-    calls = []
 
     class Killed:
         timed_out = False
         returncode = -9
         ok = False
-        stderr = "Killed"
+        stderr = "frame=  557 fps= 22 q=29.0 size=  4096KiB time=00:00:18.56 speed=0.739x"
 
-    def fake_run(args, **kwargs):
-        calls.append(args)
-        return Killed()
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(_clip_render, "run", lambda *a, **k: Killed())
+        with pytest.raises(_clip_render.RenderError) as caught:
+            _clip_render.encode([Path("a.mp4")], Path("."), "g", Path("out.mp4"))
 
-    monkeypatch.setattr(_clip_render, "run", fake_run)
-    with pytest.raises(_clip_render.RenderError) as caught:
-        _clip_render.encode([tmp_path / "a.mp4"], tmp_path, "g", tmp_path / "out.mp4")
-
-    assert len(calls) == 2  # tried fast, tried frugal, stopped
+    assert "OOM killer" in caught.value.message
     assert "SIFT_MEM_LIMIT" in caught.value.hint

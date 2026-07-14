@@ -38,11 +38,14 @@ services:
       # Scopes the optional Watchtower below to THIS container only.
       com.centurylinklabs.watchtower.enable: "true"
 
-    # The render worker is the memory story: ffmpeg is modest, but MediaPipe adds
-    # ~300-400 MB while a reframe is in flight. 2 GiB holds a 4 GB VPS comfortably;
-    # raise it if you enable VISION and cut long clips.
-    mem_limit: ${SIFT_MEM_LIMIT:-2g}
-    memswap_limit: ${SIFT_MEM_LIMIT:-2g}
+    # The encode is the memory story, not MediaPipe. A 45s 1080x1920 clip on the split
+    # follow/fit graph peaks at ~1.3 GB of ffmpeg RSS — measured, and it plateaus rather
+    # than growing, so the buffers are simply big. Against a 2 GiB cap that lands close
+    # enough to the ceiling that the kernel OOM-killed one clip out of a batch of 25 while
+    # an identical clip rendered fine minutes earlier. 3g leaves a gigabyte of headroom on
+    # the 4 GB VPS this targets.
+    mem_limit: ${SIFT_MEM_LIMIT:-3g}
+    memswap_limit: ${SIFT_MEM_LIMIT:-3g}
     # Two encodes never run at once (the single render worker enforces that), so
     # capping CPU keeps ffmpeg from starving the router on a small box.
     cpus: ${SIFT_CPUS:-2}

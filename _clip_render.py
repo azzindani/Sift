@@ -569,23 +569,20 @@ def encode(
     filtergraph: str,
     output: Path,
     crf: int = 23,
-    frugal: bool = False,
 ) -> None:
     """Run the assembly pass over the segment intermediates.
 
     cwd=temp, so the ASS file and fonts dir are bare relative names and need no
     filtergraph escaping (a path with a colon or backslash would otherwise break it).
 
-    ``frugal`` runs the filter graph on a single thread. ffmpeg gives each filter its own
-    thread by default and each holds its own frame buffers, which at 1080x1920 across a
-    split follow/fit graph is most of the memory the encode uses. It is the slower, smaller
-    way to get the same bytes — the retry path after the box kills the fast one.
+    Measured peak: ~1.3 GB RSS for a 45s 1080x1920 clip on the split follow/fit graph. It
+    plateaus — the buffers are big, not leaking — which is why the container's cap is 3g and
+    not 2g. Running the filters on one thread was tried and does not bring the peak under
+    2 GiB, so there is no cheaper graph to fall back to.
     """
     args = [ffmpeg_bin(), "-hide_banner", "-nostdin", "-y"]
     for path in inputs:
         args += ["-i", str(path)]
-    if frugal:
-        args += ["-filter_complex_threads", "1"]
     args += [
         "-filter_complex",
         filtergraph,
@@ -620,26 +617,24 @@ def encode(
             f"Encode timed out after {ENCODE_TIMEOUT_S:.0f}s",
             "The clip is too long or the box is loaded. Shorten the clip and retry render_clip.",
         )
-    # Exit -9 is SIGKILL, and nothing in this pipeline sends it — it is the kernel's OOM
-    # killer. On the 2c/4GB box the encode shares its cgroup with the worker, so a long clip
-    # on a wide filter graph can tip the container over while an identical one rendered fine
-    # a minute earlier. Losing one clip out of a batch to that is not acceptable when the
-    # same bytes come out of a slower, single-threaded graph.
-    if result.returncode == -9 and not frugal:
-        log.warning("encode was OOM-killed — retrying on a single filter thread")
-        encode(inputs, temp, filtergraph, output, crf, frugal=True)
-        return
-
     if not result.ok or not output.is_file():
         tail = "\n".join(result.stderr.strip().splitlines()[-4:])[:600]
-        killed = result.returncode == -9
+        # Exit -9 is SIGKILL, and nothing in this pipeline sends it. It is the kernel's OOM
+        # killer, and the failure reads nothing like one — ffmpeg's last line is a normal
+        # progress counter, so it looks like the encode simply stopped. Name it, or the next
+        # person spends the afternoon reading filtergraphs.
+        if result.returncode == -9:
+            raise RenderError(
+                f"ffmpeg encode failed (exit -9): the kernel's OOM killer stopped it. "
+                f"Last progress: {tail.splitlines()[-1][:120] if tail else 'none'}",
+                "The container hit its memory cap. A 1080x1920 encode of this graph peaks "
+                "around 1.3 GB, so raise SIFT_MEM_LIMIT (3g is the default for good reason) "
+                "or render a shorter clip.",
+            )
         raise RenderError(
             f"ffmpeg encode failed (exit {result.returncode}): {tail}",
-            "The box ran out of memory even on a single filter thread — raise SIFT_MEM_LIMIT "
-            "or shorten the clip."
-            if killed
-            else "Check the clip span lies inside the source. Retry with reframe='center' if "
-            "the crop expression is at fault.",
+            "Check the clip span lies inside the source. Retry with reframe='center' if the "
+            "crop expression is at fault.",
         )
 
 
